@@ -7,12 +7,14 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {CTOFeeVault} from "../src/CTOFeeVault.sol";
 import {LaunchToken} from "../src/LaunchToken.sol";
 import {NoxaCTOFund} from "../src/NoxaCTOFund.sol";
+import {OwnableUpgradeable} from "../src/utils/Upgradeable.sol";
 import {ICTOFeeVault, INoxaCTOFactory, INoxaCTOFund} from "../src/interfaces/INoxaCTO.sol";
 import {Clones} from "../src/libraries/Clones.sol";
 
 interface Vm {
     function deal(address account, uint256 newBalance) external;
     function expectRevert(bytes4 revertData) external;
+    function expectRevert(bytes calldata revertData) external;
     function prank(address msgSender) external;
     function warp(uint256 newTimestamp) external;
 }
@@ -258,6 +260,36 @@ contract NoxaCTOCoreTest {
         fund.setQuorumBps(9_000);
         _assertEq(fund.roundCirculatingSupply(address(token)), 300 * UNIT, "circulation was not pinned");
         _assertEq(fund.roundQuorum(address(token)), 120 * UNIT, "quorum was not pinned");
+    }
+
+    function testPerTokenQuorumOverridePinsAtNextRound() external {
+        // Override takes effect at the next round open; the global default is untouched.
+        fund.setTokenQuorumBps(address(token), 8_000);
+        _assertEq(fund.effectiveQuorumBps(address(token)), 8_000, "override not effective");
+        _assertEq(fund.quorumBps(), 4_000, "global default must not change");
+
+        fund.openRound(address(token));
+        _assertEq(fund.roundQuorumBps(address(token)), 8_000, "override not pinned into round");
+        _finalizeOpeningTimestamp();
+        fund.finalizeRound(address(token));
+        _assertEq(fund.roundQuorum(address(token)), 240 * UNIT, "wrong overridden quorum");
+
+        // Clearing the override cannot alter the active round, only future ones.
+        fund.setTokenQuorumBps(address(token), 0);
+        _assertEq(fund.roundQuorumBps(address(token)), 8_000, "active round quorum must stay pinned");
+        _assertEq(fund.effectiveQuorumBps(address(token)), 4_000, "cleared override should restore default");
+    }
+
+    function testTokenQuorumOverrideValidationAndAuth() external {
+        vm.expectRevert(NoxaCTOFund.InvalidBasisPoints.selector);
+        fund.setTokenQuorumBps(address(token), 10_001);
+
+        vm.expectRevert(NoxaCTOFund.UnknownToken.selector);
+        fund.setTokenQuorumBps(address(0xDEAD11), 5_000);
+
+        vm.prank(ALICE);
+        vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, ALICE));
+        fund.setTokenQuorumBps(address(token), 5_000);
     }
 
     function testCannotOpenRoundDuringPoolSwapOrFlash() external {

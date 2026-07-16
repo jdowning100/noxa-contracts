@@ -5,6 +5,7 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {NoxaBuyBurner} from "../src/NoxaBuyBurner.sol";
+import {Noxa2Token} from "../src/Noxa2Token.sol";
 import {FeeRouter} from "../src/FeeRouter.sol";
 import {LauncherLocker} from "../src/LauncherLocker.sol";
 import {LauncherTypes} from "../src/LauncherTypes.sol";
@@ -24,9 +25,13 @@ interface VmFork {
     function startPrank(address caller) external;
     function stopPrank() external;
     function roll(uint256 newHeight) external;
+    function warp(uint256 newTimestamp) external;
     function expectRevert(bytes4 revertData) external;
     function expectRevert(bytes calldata revertData) external;
-    function warp(uint256 newTimestamp) external;
+}
+
+interface IPoolOracleAdmin {
+    function increaseObservationCardinalityNext(uint16 observationCardinalityNext) external;
 }
 
 contract MockJunkToken is ERC20 {
@@ -35,8 +40,8 @@ contract MockJunkToken is ERC20 {
     }
 }
 
-/// @dev Not canonical on the V3 factory; used to prove a caller-supplied fake
-/// pool cannot reach the swap callback.
+/// @dev Reports a fee but is not canonical on the V3 factory; used to prove a
+/// caller-supplied pool cannot reach the swap callback.
 contract FakePool {
     function fee() external pure returns (uint24) {
         return 10000;
@@ -55,8 +60,6 @@ contract NoxaBuyBurnerForkTest {
     address constant V3_FACTORY = 0x1f7d7550B1b028f7571E69A784071F0205FD2EfA;
     address constant NPM = 0x73991a25C818Bf1f1128dEAaB1492D45638DE0D3;
     // Live noxa2 deployment.
-    address constant NOXA = 0xe7ED1feF415384B3fF1Caa67d3AB4A3A8252F0e7;
-    address constant AIRDROP = 0xc0D0Ddf402a9b030faa39c5FB02b96646B5e5461;
     address constant FACTORY = 0x003a2052B2c86E700C43f7FaB47733207B08a264;
     address constant LOCKER = 0x11447d70c0Cb62CaDb21e70Eba8ce616cA5Bf82e;
     address payable constant FEE_ROUTER = payable(0x914f94b62781dd1524D650cefcC916Ca40450397);
@@ -66,6 +69,9 @@ contract NoxaBuyBurnerForkTest {
     uint160 constant SQRT_PRICE_1_1 = 79228162514264337593543950336; // tick 0
 
     NoxaBuyBurner burner;
+    // Stand-in for the pre-existing on-chain NOXA: the burn target is set
+    // post-deployment, so tests deploy a fresh token to burn.
+    address noxa;
     address burnPool;
     address launched;
     address launchedPool;
@@ -78,15 +84,19 @@ contract NoxaBuyBurnerForkTest {
     function setUp() public {
         vm.createSelectFork("http://127.0.0.1:8547");
 
-        burner = new NoxaBuyBurner(V3_FACTORY, WETH, NOXA, LAUNCH_FEE_TIER, address(this));
+        burner = new NoxaBuyBurner(V3_FACTORY, WETH, FACTORY, address(this));
+        // The real NOXA pre-exists on-chain and is wired via setBurnTarget
+        // after deployment; tests mint a fresh stand-in (1M supply to us).
+        noxa = address(new Noxa2Token(address(this), "", "", Noxa2Token.Socials("", "", "", "", "")));
 
-        // Seed a NOXA/WETH pool at the launcher tier (1:1 for test simplicity).
-        vm.prank(AIRDROP);
-        IERC20(NOXA).transfer(address(this), 400_000 ether);
+        // Seed a NOXA/WETH pool at the launcher tier (1:1 for test simplicity)
+        // and make its oracle strict-caller-ready: grow cardinality and
+        // populate observations across blocks, then let a full window elapse.
         vm.deal(address(this), 1_000_000 ether);
         IWETH9(WETH).deposit{value: 400_000 ether}();
         burnPool = _createPool(LAUNCH_FEE_TIER, 300_000 ether, -200_000, 200_000);
-        burner.setBurnTarget(NOXA, burnPool);
+        _makeOracleReady(burnPool);
+        burner.setBurnTarget(noxa, burnPool);
 
         // Repoint the protocol treasury at the burner (owner-only, live owner).
         vm.prank(FeeRouter(FEE_ROUTER).owner());
@@ -130,13 +140,13 @@ contract NoxaBuyBurnerForkTest {
         require(IERC20(launched).balanceOf(address(burner)) == 0, "launched tokens fully swept");
         require(IERC20(WETH).balanceOf(address(burner)) > 0, "sweep proceeds held as WETH");
 
-        uint256 deadBefore = IERC20(NOXA).balanceOf(burner.BURN_ADDRESS());
+        uint256 deadBefore = IERC20(noxa).balanceOf(burner.BURN_ADDRESS());
         uint256 burned = burner.burn();
         require(burned > 0, "burn should destroy NOXA");
-        require(IERC20(NOXA).balanceOf(burner.BURN_ADDRESS()) - deadBefore == burned, "burn accounting");
+        require(IERC20(noxa).balanceOf(burner.BURN_ADDRESS()) - deadBefore == burned, "burn accounting");
         require(address(burner).balance == 0, "all ETH consumed");
         require(IERC20(WETH).balanceOf(address(burner)) == 0, "all WETH consumed");
-        require(IERC20(NOXA).balanceOf(address(burner)) == 0, "no NOXA retained");
+        require(IERC20(noxa).balanceOf(address(burner)) == 0, "no NOXA retained");
     }
 
     function test_receive_neverReverts() public {
@@ -148,7 +158,7 @@ contract NoxaBuyBurnerForkTest {
 
     function test_sweep_skipsBadTokens_continuesBatch() public {
         MockJunkToken junk = new MockJunkToken();
-        junk.transfer(address(burner), 1e21); // donated token with no pool
+        junk.transfer(address(burner), 1e21); // donated token with no official pool
 
         address[] memory tokens = new address[](3);
         tokens[0] = address(junk);
@@ -160,52 +170,85 @@ contract NoxaBuyBurnerForkTest {
         require(junk.balanceOf(address(burner)) == 1e21, "junk untouched, rescuable");
     }
 
-    function test_burn_thinPool_partialFill_noRevert() public {
+    function test_burn_thinPool_partialFill_noRevert_noRearm() public {
         // 0.3% tier pool with tiny liquidity, then far more ETH than it holds.
         address thin = _createPool(3000, 50 ether, -60_000, 60_000);
-        burner.setBurnTarget(NOXA, thin);
+        burner.setBurnTarget(noxa, thin);
         vm.deal(address(this), 5_000 ether);
         (bool ok,) = address(burner).call{value: 5_000 ether}("");
         require(ok, "fund burner");
 
-        uint256 deadBefore = IERC20(NOXA).balanceOf(burner.BURN_ADDRESS());
-        uint256 burned = burner.burn(); // must not revert
+        uint256 lastBurnBefore = burner.lastBurnAt();
+        uint256 deadBefore = IERC20(noxa).balanceOf(burner.BURN_ADDRESS());
+        uint256 burned = burner.burn(); // owner call; must not revert
         require(burned > 0, "partial fill still burns");
-        require(IERC20(NOXA).balanceOf(burner.BURN_ADDRESS()) > deadBefore, "dead balance grew");
+        require(IERC20(noxa).balanceOf(burner.BURN_ADDRESS()) > deadBefore, "dead balance grew");
         require(IERC20(WETH).balanceOf(address(burner)) > 0, "unswapped WETH retained for later");
+        require(burner.lastBurnAt() == lastBurnBefore, "partial fill must not re-arm public cooldown");
     }
 
-    function test_sweepToken_explicitPool() public {
-        uint256 out = burner.sweepToken(launched, launchedPool);
-        require(out > 0, "explicit pool sweep");
+    // ---------------------------------------------------------------- pool trust
+
+    function test_publicSweep_cannotChoosePool_usesOfficialMapping() public {
+        // The permissionless entrypoint takes no pool at all; resolution is
+        // factory-only. A non-launched token has no official pool and fails
+        // closed even though canonical V3 pools for it could exist.
+        MockJunkToken junk = new MockJunkToken();
+        junk.transfer(address(burner), 1e21);
+        vm.prank(STRANGER);
+        vm.expectRevert(NoxaBuyBurner.NoOfficialPool.selector);
+        burner.sweepToken(address(junk));
     }
 
-    // ---------------------------------------------------------------- safety
-
-    function test_callback_rejectsUninvitedCaller() public {
-        vm.expectRevert(NoxaBuyBurner.UnexpectedCallback.selector);
-        burner.uniswapV3SwapCallback(1, -1, abi.encode(WETH));
-    }
-
-    function test_sweepToken_rejectsFakePool() public {
+    function test_sweepTokenVia_ownerOnly_rejectsFakePool() public {
         FakePool fake = new FakePool();
         vm.expectRevert(NoxaBuyBurner.InvalidPool.selector);
-        burner.sweepToken(launched, address(fake));
+        burner.sweepTokenVia(launched, address(fake));
+
+        vm.prank(STRANGER);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, STRANGER));
+        burner.sweepTokenVia(launched, launchedPool);
     }
 
-    function test_setBurnTarget_rejectsWrongPairPool() public {
-        vm.expectRevert(NoxaBuyBurner.InvalidPool.selector);
-        burner.setBurnTarget(NOXA, launchedPool); // canonical, but not NOXA/WETH
+    function test_sweepTokenVia_ownerEscapeHatch() public {
+        uint256 out = burner.sweepTokenVia(launched, launchedPool);
+        require(out > 0, "owner explicit-pool sweep");
     }
+
+    // ---------------------------------------------------------------- oracle gate
+
+    function test_publicSweep_revertsWithoutOracle() public {
+        // Fresh launch pools have observation cardinality 1: untrusted
+        // callers must not fall back to manipulable spot.
+        vm.prank(STRANGER);
+        vm.expectRevert(NoxaBuyBurner.OracleNotReady.selector);
+        burner.sweepToken(launched);
+    }
+
+    function test_ownerSweep_toleratesSpotFallback() public {
+        uint256 out = burner.sweepToken(launched); // owner: spot anchor allowed
+        require(out > 0, "owner sweep works without oracle history");
+    }
+
+    function test_publicBurn_revertsWithoutOracle() public {
+        address thin = _createPool(3000, 50 ether, -60_000, 60_000); // cardinality 1
+        burner.setBurnTarget(noxa, thin);
+        vm.warp(block.timestamp + burner.PUBLIC_BURN_DELAY() + 1);
+        vm.prank(STRANGER);
+        vm.expectRevert(NoxaBuyBurner.OracleNotReady.selector);
+        burner.burn();
+    }
+
+    // ---------------------------------------------------------------- burn gate
 
     function test_burn_ownerGate_and_publicFallback() public {
-        // Fresh burner: stranger blocked inside the delay window.
+        // Stranger blocked inside the delay window.
         vm.prank(STRANGER);
         vm.expectRevert(NoxaBuyBurner.BurnLocked.selector);
         burner.burn();
 
-        // After the delay, anyone may burn; a successful public burn re-arms
-        // the window so the next public attempt is blocked again.
+        // After the delay, anyone may burn (burn pool is oracle-ready); the
+        // complete burn re-arms the window so the next attempt is blocked.
         vm.warp(block.timestamp + burner.PUBLIC_BURN_DELAY() + 1);
         vm.prank(STRANGER);
         uint256 burned = burner.burn();
@@ -227,6 +270,22 @@ contract NoxaBuyBurnerForkTest {
         require(burner.burn() > 0, "no re-armed window without an owner");
     }
 
+    // ---------------------------------------------------------------- admin
+
+    function test_burn_revertsUntilTargetConfigured() public {
+        // Fresh burner exactly as the deploy script leaves it: no target yet.
+        NoxaBuyBurner fresh = new NoxaBuyBurner(V3_FACTORY, WETH, FACTORY, address(this));
+        (bool ok,) = address(fresh).call{value: 1 ether}("");
+        require(ok, "fees accumulate before target is set");
+        vm.expectRevert(NoxaBuyBurner.BurnTargetNotSet.selector);
+        fresh.burn();
+    }
+
+    function test_setBurnTarget_rejectsWrongPairPool() public {
+        vm.expectRevert(NoxaBuyBurner.InvalidPool.selector);
+        burner.setBurnTarget(noxa, launchedPool); // canonical, but not NOXA/WETH
+    }
+
     function test_setBurnTarget_switchesToken() public {
         // Retarget burning at the launched token via its canonical pool.
         burner.setBurnTarget(launched, launchedPool);
@@ -236,19 +295,26 @@ contract NoxaBuyBurnerForkTest {
         require(IERC20(launched).balanceOf(burner.BURN_ADDRESS()) - deadBefore == burned, "retarget accounting");
         // The old target is now an ordinary token again: sweepable, not burnable.
         vm.expectRevert(NoxaBuyBurner.InvalidToken.selector);
-        burner.sweepToken(launched, address(0));
+        burner.sweepToken(launched);
     }
 
     function test_adminFunctions_onlyOwner() public {
         bytes memory unauthorized = abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, STRANGER);
         vm.startPrank(STRANGER);
         vm.expectRevert(unauthorized);
-        burner.setBurnTarget(NOXA, burnPool);
+        burner.setBurnTarget(noxa, burnPool);
         vm.expectRevert(unauthorized);
-        burner.setSwapGuard(60, 100);
+        burner.setSwapGuard(60, 100, 8);
         vm.expectRevert(unauthorized);
-        burner.rescueToken(NOXA, STRANGER, 1);
+        burner.rescueToken(noxa, STRANGER, 1);
         vm.stopPrank();
+    }
+
+    function test_setSwapGuard_rejectsSpotOnlyConfig() public {
+        vm.expectRevert(NoxaBuyBurner.InvalidGuardConfig.selector);
+        burner.setSwapGuard(0, 300, 8); // twapWindow 0 would disable the oracle
+        vm.expectRevert(NoxaBuyBurner.InvalidGuardConfig.selector);
+        burner.setSwapGuard(1800, 300, 1); // cardinality 1 degenerates to spot
     }
 
     function test_rescueToken() public {
@@ -264,10 +330,10 @@ contract NoxaBuyBurnerForkTest {
         internal
         returns (address pool)
     {
-        (address token0, address token1) = WETH < NOXA ? (WETH, NOXA) : (NOXA, WETH);
+        (address token0, address token1) = WETH < noxa ? (WETH, noxa) : (noxa, WETH);
         pool = INonfungiblePositionManager(NPM).createAndInitializePoolIfNecessary(token0, token1, fee, SQRT_PRICE_1_1);
         IERC20(WETH).approve(NPM, amountPerSide);
-        IERC20(NOXA).approve(NPM, amountPerSide);
+        IERC20(noxa).approve(NPM, amountPerSide);
         INonfungiblePositionManager(NPM).mint(
             INonfungiblePositionManager.MintParams({
                 token0: token0,
@@ -283,6 +349,19 @@ contract NoxaBuyBurnerForkTest {
                 deadline: block.timestamp + 1 hours
             })
         );
+    }
+
+    /// @dev Grow a pool's observation ring and populate it with one write per
+    /// block, then let a full TWAP window elapse so strict callers pass.
+    function _makeOracleReady(address pool) internal {
+        IPoolOracleAdmin(pool).increaseObservationCardinalityNext(12);
+        for (uint256 i = 0; i < 12; i++) {
+            vm.roll(block.number + 1);
+            vm.warp(block.timestamp + 300);
+            _poolSwap(pool, WETH, 0.01 ether);
+        }
+        vm.roll(block.number + 1);
+        vm.warp(block.timestamp + 1801);
     }
 
     /// @dev Direct exact-input pool swap from the test; callback below pays.

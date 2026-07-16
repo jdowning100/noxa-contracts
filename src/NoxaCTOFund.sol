@@ -63,6 +63,10 @@ contract NoxaCTOFund is OwnableUpgradeable, ReentrancyGuardUpgradeable {
     mapping(address token => uint256) public roundLeaderClaimDelay;
     mapping(address token => uint256) public roundMinimumCirculating;
     mapping(address token => uint256) public roundQuorumBps;
+    /// @notice Per-token quorum override in bps; 0 means "use the global
+    /// `quorumBps` default". Pinned into a round when it opens, exactly like
+    /// the global value — an active round is never affected by changes.
+    mapping(address token => uint256) public tokenQuorumBps;
 
     mapping(address token => mapping(uint256 electionRound => mapping(address candidate => uint256))) public tally;
     mapping(address token => mapping(uint256 electionRound => mapping(address voter => address))) public voterChoice;
@@ -98,6 +102,7 @@ contract NoxaCTOFund is OwnableUpgradeable, ReentrancyGuardUpgradeable {
         uint256 nativeAmount
     );
     event QuorumBpsUpdated(uint256 quorumBps);
+    event TokenQuorumBpsUpdated(address indexed token, uint256 quorumBps);
     event MinCircBpsUpdated(uint256 minCircBps);
     event ReopenCooldownUpdated(uint256 reopenCooldown);
     event LeaderClaimDelayUpdated(uint256 leaderClaimDelay);
@@ -180,7 +185,7 @@ contract NoxaCTOFund is OwnableUpgradeable, ReentrancyGuardUpgradeable {
         roundVoteStart[token] = voteStartsAt;
         roundLeaderClaimDelay[token] = leaderClaimDelay;
         roundMinimumCirculating[token] = minimumCirculating;
-        roundQuorumBps[token] = quorumBps;
+        roundQuorumBps[token] = effectiveQuorumBps(token);
 
         emit RoundOpened(token, newRound, snapshotId, voteStartsAt, reopenAt);
     }
@@ -317,6 +322,22 @@ contract NoxaCTOFund is OwnableUpgradeable, ReentrancyGuardUpgradeable {
         emit QuorumBpsUpdated(value);
     }
 
+    /// @notice Set (or clear, with 0) a per-token quorum override. Takes
+    /// effect when the token's NEXT round opens; the quorum of a round
+    /// already underway is pinned and cannot be moved.
+    function setTokenQuorumBps(address token, uint256 value) external onlyOwner {
+        _requireToken(token);
+        if (value > BPS) revert InvalidBasisPoints();
+        tokenQuorumBps[token] = value;
+        emit TokenQuorumBpsUpdated(token, value);
+    }
+
+    /// @notice Quorum bps the token's next round will open with.
+    function effectiveQuorumBps(address token) public view returns (uint256) {
+        uint256 quorumOverride = tokenQuorumBps[token];
+        return quorumOverride != 0 ? quorumOverride : quorumBps;
+    }
+
     function setMinCircBps(uint256 value) external onlyOwner {
         if (value > BPS) revert InvalidBasisPoints();
         minCircBps = value;
@@ -342,5 +363,5 @@ contract NoxaCTOFund is OwnableUpgradeable, ReentrancyGuardUpgradeable {
     }
 
     /// @dev Reserved for future implementation upgrades. Keep this as the final storage field.
-    uint256[41] private __gap;
+    uint256[40] private __gap;
 }
