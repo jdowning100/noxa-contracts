@@ -96,6 +96,13 @@ contract MockV3Pool {
         return (uint160(1 << 96), 0, 0, 0, 0, 0, true);
     }
 
+    /// @dev Records the factory's launch-time oracle pre-warm request.
+    uint16 public observationCardinalityNext;
+
+    function increaseObservationCardinalityNext(uint16 value) external {
+        if (value > observationCardinalityNext) observationCardinalityNext = value;
+    }
+
     function swap(address, bool, int256, uint160, bytes calldata) external pure returns (int256, int256) {
         revert("NO_INITIAL_BUY");
     }
@@ -299,6 +306,11 @@ contract NoxaFactoryIntegrationTest {
 
         _assertEq(launched.feeWallet, DEV_WALLET, "legacy feeWallet changed");
         _assertEq(locker.feeWalletOf(token), vault, "locker not routed to vault");
+        _assertEq(
+            uint256(MockV3Pool(launched.pool).observationCardinalityNext()),
+            8,
+            "launch pool oracle buffer not pre-warmed"
+        );
         _assertEq(ctoFund.leader(token), DEV_WALLET, "initial leader");
         _assertEq(CTOFeeVault(payable(vault)).token(), token, "vault token");
         _assertEq(CTOFeeVault(payable(vault)).pairToken(), address(weth), "vault pair");

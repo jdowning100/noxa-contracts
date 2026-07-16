@@ -94,6 +94,10 @@ contract LaunchFactory is Ownable, ReentrancyGuard, IUniswapV3SwapCallback {
     event CTOFeeVaultCreated(address indexed token, address indexed vault, address indexed initialLeader);
     event FeeTreasuryRestrictionExempted(address indexed token, address indexed treasury);
 
+    /// @dev Oracle ring-buffer slots pre-warmed on every launch pool (~20k gas
+    /// each, paid by the launcher) so strict TWAP consumers work permissionlessly.
+    uint16 internal constant OBSERVATION_CARDINALITY = 8;
+
     LauncherLocker public immutable locker;
     address public immutable ctoVaultImplementation;
 
@@ -357,6 +361,13 @@ contract LaunchFactory is Ownable, ReentrancyGuard, IUniswapV3SwapCallback {
         pool = pm.createAndInitializePoolIfNecessary(
             token0, token1, dex.poolFee, TickMath.getSqrtRatioAtTick(initialTick)
         );
+        // Pre-warm the oracle ring buffer so the pool can serve TWAPs once
+        // trades populate it. Fresh V3 pools store a single observation, which
+        // is useless as a manipulation-resistant anchor; the buy-burner (and
+        // any other strict consumer) requires real history before allowing
+        // permissionless swaps through the pool. Idempotent and grow-only, so
+        // relaunches against a pre-existing pool can never shrink it.
+        IUniswapV3Pool(pool).increaseObservationCardinalityNext(OBSERVATION_CARDINALITY);
 
         LaunchToken lt = LaunchToken(token);
         lt.setVotingExcluded(pool);
