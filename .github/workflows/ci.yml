@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Build
+        run: forge build
+
+      # The NoxaBuyBurnerForkTest suite forks the live Robinhood chain and
+      # needs a local node at 127.0.0.1:8547; it only runs locally.
+      - name: Test (self-contained suites)
+        run: forge test --no-match-contract ForkTest -vv
