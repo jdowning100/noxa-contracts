@@ -21,33 +21,39 @@ interface ILaunchpadPools {
 }
 
 /// @notice Protocol-fee sink that converts everything it receives into the
-/// burn token and destroys it. Intended as the `FeeRouter.treasury` /
-/// launch-fee recipient:
-///   - native ETH (unwrapped pair fees, launch fees) arrives via `receive()`
+/// burn token and destroys it. Intended as one of the FeeRouter recipients and
+/// as the WETH launch-fee recipient:
+///   - WETH pair-fee shares arrive as WETH ERC20 transfers
+///   - launch fees arrive wrapped as WETH ERC20 transfers
 ///   - launched-token fee shares arrive as plain ERC20 transfers
-/// `sweep`/`sweepToken` (token -> WETH) and `burn` (ETH -> WETH -> burn token
-/// -> dead address) then process the inventory.
+/// `sweep`/`sweepToken` (token -> WETH) and `burn` (wrap any accidentally sent
+/// native asset, then WETH -> burn token -> dead address) process the inventory.
 ///
 /// Design constraints inherited from the fee path:
-///   - `receive()` must never revert: FeeRouter.distribute and LaunchFactory
-///     launches send ETH here and bubble failures, so any revert would brick
-///     fee collection and new launches. It therefore does nothing.
+///   - `receive()` accepts accidental or legacy native transfers so they can
+///     be wrapped and included in the next burn.
 ///   - Permissionless sweeps resolve the pool from the launchpad factory's
 ///     `poolOf` mapping — callers can never steer a swap into a pool of their
 ///     choosing (a second factory-created pool for the same pair at another
 ///     fee tier, initialized at a hostile price, would otherwise let them
 ///     drain the inventory). The owner has `sweepTokenVia` as an explicit
 ///     escape hatch for tokens without an official pool.
-///   - Swaps by untrusted callers demand a healthy oracle: the pool must
-///     carry at least `minObservationCardinality` observations and serve a
-///     full `twapWindow` TWAP, otherwise the call reverts with
-///     `OracleNotReady`. There is deliberately NO spot fallback for them — a
-///     fresh V3 pool stores a single observation, and a spot anchor is
-///     attacker-positionable within one transaction. Owner-initiated swaps
-///     may fall back to spot (the owner chooses its own timing). Anyone can
-///     make a pool oracle-ready by calling its permissionless
-///     `increaseObservationCardinalityNext` and letting trades populate it.
-///   - The TWAP anchor is shifted at most `maxTickDrift` ticks in the swap
+///   - Untrusted swaps are priced against a COMMIT-DELAY-EXECUTE forward
+///     TWAP, not the pool oracle ring: V3 only writes ring observations when
+///     a swap crosses a tick and pools default to a single slot, so
+///     ring-based TWAPs are unreliable here. Instead, anyone may
+///     `recordAnchor(pool)`, storing the pool's live `tickCumulative`
+///     (observe([0]), which never depends on ring capacity); the anchor
+///     becomes usable after `anchorDelay` and expires at `anchorValidity`.
+///     Execution prices against the TRUE average tick over the elapsed
+///     period — (cumulativeNow - cumulativeRecorded) / elapsed. Because the
+///     cumulative is a time integral, an atomic manipulate-record-unwind (or
+///     manipulate-execute-unwind) contributes ~zero weight to it: biasing the
+///     average requires HOLDING a hostile price for a meaningful fraction of
+///     the window, exposed to arbitrage the whole time. There is deliberately
+///     NO spot path for untrusted callers; owner-initiated swaps price off
+///     spot directly (the owner chooses its own timing).
+///   - The anchor tick is shifted at most `maxTickDrift` in the swap
 ///     direction, so a thin or manipulated pool produces a PARTIAL fill
 ///     instead of a revert or a bad execution; the remainder waits.
 ///   - `sweep` isolates each token in a self-call so one bad entry (fee-on-
@@ -73,17 +79,24 @@ contract NoxaBuyBurner is Ownable, ReentrancyGuard {
     error NothingToSweep();
     error AmountOverflow();
     error InvalidGuardConfig();
-    error OracleNotReady();
+    error AnchorNotReady();
+    error AnchorPending();
     error UnexpectedCallback();
     error NotSelf();
     error BurnLocked();
 
     event BurnTargetUpdated(address token, address pool);
-    event SwapGuardUpdated(uint32 twapWindow, uint24 maxTickDrift, uint16 minObservationCardinality);
+    event SwapGuardUpdated(uint32 anchorDelay, uint32 anchorValidity, uint24 maxTickDrift);
+    event AnchorRecorded(address indexed pool, int56 tickCumulative, uint256 usableAt, uint256 expiresAt);
     event Swept(address indexed token, address indexed pool, uint256 amountIn, uint256 wethOut);
     event SweepFailed(address indexed token, bytes reason);
     event Burned(uint256 wethIn, uint256 swapOut, uint256 amountBurned);
     event Rescued(address indexed token, address indexed to, uint256 amount);
+
+    struct PriceAnchor {
+        int56 tickCumulative;
+        uint40 recordedAt;
+    }
 
     /// @dev OZ ERC20 reverts on transfer to address(0); dead is the burn convention.
     address public constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
@@ -109,16 +122,18 @@ contract NoxaBuyBurner is Ownable, ReentrancyGuard {
     /// fallback. Not re-armed by partial fills.
     uint256 public lastBurnAt;
 
-    /// @notice TWAP lookback for the swap price guard. Mandatory (and never
-    /// spot-substituted) for untrusted callers.
-    uint32 public twapWindow = 1800;
+    /// @notice Commit-delay-execute cumulative snapshots, per pool. See notice.
+    mapping(address pool => PriceAnchor) public priceAnchor;
+    /// @notice Minimum anchor age before an untrusted caller may swap against
+    /// it — the averaging window floor. Manipulating the resulting mean by
+    /// X ticks requires holding a price X ticks out (or proportionally
+    /// further, for less time) across this window, against arbitrage.
+    uint32 public anchorDelay = 300;
+    /// @notice Anchor lifetime; after this it is stale and re-recordable.
+    uint32 public anchorValidity = 3600;
     /// @notice Max ticks the execution price may drift past the anchor
     /// (1 tick ~= 1 bp). Swaps stop at this bound and partially fill.
     uint24 public maxTickDrift = 300;
-    /// @notice Minimum pool observation cardinality before an untrusted
-    /// caller may swap through it. A cardinality-1 pool "TWAP" degenerates to
-    /// spot by extrapolation, so 1 is never acceptable.
-    uint16 public minObservationCardinality = 8;
 
     /// @dev Pool allowed to invoke the swap callback for the current swap.
     address private expectedPool;
@@ -131,7 +146,7 @@ contract NoxaBuyBurner is Ownable, ReentrancyGuard {
         lastBurnAt = block.timestamp;
     }
 
-    /// @dev Bare ETH sink — see contract notice; must never revert.
+    /// @dev Accept accidental or legacy native transfers for the next burn.
     receive() external payable {}
 
     // ---------------------------------------------------------------- admin
@@ -149,18 +164,15 @@ contract NoxaBuyBurner is Ownable, ReentrancyGuard {
         emit BurnTargetUpdated(token, pool);
     }
 
-    function setSwapGuard(uint32 twapWindow_, uint24 maxTickDrift_, uint16 minObservationCardinality_)
-        external
-        onlyOwner
-    {
+    function setSwapGuard(uint32 anchorDelay_, uint32 anchorValidity_, uint24 maxTickDrift_) external onlyOwner {
         if (
-            twapWindow_ == 0 || maxTickDrift_ == 0 || maxTickDrift_ > uint24(uint256(int256(TickMath.MAX_TICK)))
-                || minObservationCardinality_ < 2
+            anchorDelay_ < 60 || anchorValidity_ <= anchorDelay_ || maxTickDrift_ == 0
+                || maxTickDrift_ > uint24(uint256(int256(TickMath.MAX_TICK)))
         ) revert InvalidGuardConfig();
-        twapWindow = twapWindow_;
+        anchorDelay = anchorDelay_;
+        anchorValidity = anchorValidity_;
         maxTickDrift = maxTickDrift_;
-        minObservationCardinality = minObservationCardinality_;
-        emit SwapGuardUpdated(twapWindow_, maxTickDrift_, minObservationCardinality_);
+        emit SwapGuardUpdated(anchorDelay_, anchorValidity_, maxTickDrift_);
     }
 
     /// @notice Escape hatch for balances that can never be swept (no pool,
@@ -171,11 +183,30 @@ contract NoxaBuyBurner is Ownable, ReentrancyGuard {
         emit Rescued(token, to, amount);
     }
 
+    // ---------------------------------------------------------------- anchors
+
+    /// @notice Snapshot `pool`'s live tick cumulative as the starting point of
+    /// a forward TWAP for untrusted swaps through it. Permissionless — the
+    /// stored value is a time integral, so a caller manipulating spot in the
+    /// recording transaction adds nothing to it. A live (pending or usable)
+    /// anchor cannot be overwritten, so nobody can reset the maturation clock
+    /// forever; once it expires anyone may record a fresh one.
+    function recordAnchor(address pool) external {
+        PriceAnchor memory existing = priceAnchor[pool];
+        if (existing.recordedAt != 0 && block.timestamp <= uint256(existing.recordedAt) + anchorValidity) {
+            revert AnchorPending();
+        }
+        int56 tickCumulative = _currentTickCumulative(pool);
+        priceAnchor[pool] = PriceAnchor(tickCumulative, uint40(block.timestamp));
+        emit AnchorRecorded(pool, tickCumulative, block.timestamp + anchorDelay, block.timestamp + anchorValidity);
+    }
+
     // ---------------------------------------------------------------- sweeping
 
     /// @notice Swap this contract's entire balance of `token` into WETH
     /// through the token's OFFICIAL launchpad pool (`launchFactory.poolOf`).
-    /// Callable by anyone; the pool is never caller-influenced.
+    /// Callable by anyone; the pool is never caller-influenced. Untrusted
+    /// callers need a matured `recordAnchor` snapshot for that pool.
     function sweepToken(address token) external nonReentrant returns (uint256 wethOut) {
         return _sweepResolved(token, msg.sender == owner());
     }
@@ -231,9 +262,10 @@ contract NoxaBuyBurner is Ownable, ReentrancyGuard {
     /// `burnPool`, and send every unit held to the dead address. Owner-only,
     /// except that once `PUBLIC_BURN_DELAY` has passed since the last
     /// complete burn anyone may call it; with ownership renounced the gate
-    /// disappears entirely. The cooldown re-arms only when the whole WETH
-    /// balance was consumed — a partial fill (price-limit hit on a thin pool)
-    /// keeps the public window open for the remainder.
+    /// disappears entirely (untrusted calls still need a matured anchor for
+    /// `burnPool`). The cooldown re-arms only when the whole WETH balance was
+    /// consumed — a partial fill (price-limit hit on a thin pool) keeps the
+    /// public window open for the remainder.
     function burn() external nonReentrant returns (uint256 amountBurned) {
         if (burnToken == address(0)) revert BurnTargetNotSet();
         address currentOwner = owner();
@@ -251,7 +283,11 @@ contract NoxaBuyBurner is Ownable, ReentrancyGuard {
         if (wethBalance > 0) {
             (wethIn, swapOut) = _swapExactIn(burnPool, address(weth), burnToken, wethBalance, trusted);
         }
-        if (wethIn == wethBalance) lastBurnAt = block.timestamp;
+        // Re-arm the public-burn cooldown ONLY when a non-empty WETH balance
+        // was consumed in full. A zero-WETH call must stay a no-op for the
+        // cooldown, otherwise a front-runner could re-lock the public fallback
+        // with an empty burn the instant the window opens (wethIn==wethBalance==0).
+        if (wethBalance > 0 && wethIn == wethBalance) lastBurnAt = block.timestamp;
 
         amountBurned = IERC20(burnToken).balanceOf(address(this));
         if (amountBurned > 0) IERC20(burnToken).safeTransfer(BURN_ADDRESS, amountBurned);
@@ -260,7 +296,7 @@ contract NoxaBuyBurner is Ownable, ReentrancyGuard {
 
     // ---------------------------------------------------------------- internals
 
-    /// @dev Exact-input single-pool swap with a TWAP-anchored price limit.
+    /// @dev Exact-input single-pool swap with an anchor-bounded price limit.
     /// Returns the amounts actually taken/received (may be a partial fill).
     function _swapExactIn(address pool, address tokenIn, address tokenOut, uint256 amountIn, bool trusted)
         private
@@ -290,9 +326,9 @@ contract NoxaBuyBurner is Ownable, ReentrancyGuard {
     }
 
     /// @dev Price limit = anchor tick shifted `maxTickDrift` in the swap
-    /// direction. For untrusted callers the anchor MUST be a real TWAP from a
-    /// pool with sufficient observation history; for the owner a spot
-    /// fallback is tolerated (see contract notice).
+    /// direction. Untrusted callers MUST have a matured, unexpired
+    /// `recordAnchor` snapshot for the pool; the owner prices off spot (it
+    /// chooses its own timing).
     function _boundedPriceLimit(address pool, bool zeroForOne, bool trusted) private view returns (uint160) {
         int24 anchorTick = _anchorTick(pool, trusted);
         int24 drift = int24(maxTickDrift);
@@ -307,25 +343,30 @@ contract NoxaBuyBurner is Ownable, ReentrancyGuard {
     }
 
     function _anchorTick(address pool, bool trusted) private view returns (int24) {
-        uint32 window = twapWindow;
-        (, int24 spotTick,, uint16 cardinality,,,) = IUniswapV3Pool(pool).slot0();
-        if (!trusted && cardinality < minObservationCardinality) revert OracleNotReady();
-
-        uint32[] memory secondsAgos = new uint32[](2);
-        secondsAgos[0] = window;
-        secondsAgos[1] = 0;
-        try IV3PoolOracle(pool).observe(secondsAgos) returns (int56[] memory tickCumulatives, uint160[] memory) {
-            int56 delta = tickCumulatives[1] - tickCumulatives[0];
-            int56 mean = delta / int56(uint56(window));
-            // Round toward negative infinity like OracleLibrary.
-            if (delta < 0 && (delta % int56(uint56(window)) != 0)) mean--;
-            return int24(mean);
-        } catch {
-            // Insufficient history for the window: only the owner may proceed
-            // on spot; permissionless execution must wait for the oracle.
-            if (!trusted) revert OracleNotReady();
+        if (trusted) {
+            (, int24 spotTick,,,,,) = IUniswapV3Pool(pool).slot0();
             return spotTick;
         }
+        PriceAnchor memory anchor = priceAnchor[pool];
+        if (anchor.recordedAt == 0) revert AnchorNotReady();
+        uint256 elapsed = block.timestamp - anchor.recordedAt;
+        if (elapsed < anchorDelay || elapsed > anchorValidity) revert AnchorNotReady();
+
+        // True average tick since recording. Atomic manipulation on either
+        // side of the window carries ~zero time weight in this delta.
+        int56 delta = _currentTickCumulative(pool) - anchor.tickCumulative;
+        int56 mean = delta / int56(uint56(elapsed));
+        // Round toward negative infinity like OracleLibrary.
+        if (delta < 0 && (delta % int56(uint56(elapsed)) != 0)) mean--;
+        return int24(mean);
+    }
+
+    /// @dev observe([0]) serves the pool's live tick cumulative regardless of
+    /// its observation ring capacity — it can never revert with OLD.
+    function _currentTickCumulative(address pool) private view returns (int56) {
+        uint32[] memory secondsAgos = new uint32[](1);
+        (int56[] memory tickCumulatives,) = IV3PoolOracle(pool).observe(secondsAgos);
+        return tickCumulatives[0];
     }
 
     function _requireCanonicalPool(address pool, address tokenA, address tokenB) private view {

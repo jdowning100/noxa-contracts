@@ -5,72 +5,99 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {IWETH9} from "./interfaces/IUniswapV3.sol";
 
-/// @notice Splits LP fees collected by the LauncherLocker between the token
-/// creator (feeWallet) and the protocol treasury. Pair-token fees paid in WETH
-/// are unwrapped to native ETH before payout.
+interface IFeeSplitterRecipient {
+    function feeRouter() external view returns (address);
+    function currentEpoch() external view returns (uint256);
+    function deposit(address token, uint256 amount) external;
+}
+
+/// @notice Splits both ERC20 assets collected by the LauncherLocker among the
+/// protocol, the buy-burner, and the token's current CTO fee vault.
 contract FeeRouter is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     error InvalidBasisPoints();
     error ZeroAddress();
-    error EthTransferFailed();
+    error InvalidRecipient();
+    error NotConfigured();
     error NotLocker();
     error AlreadyInitialized();
 
     event FeesDistributed(
         address indexed token,
-        address indexed feeWallet,
-        uint256 creatorTokenAmount,
-        uint256 creatorPairAmount,
+        address indexed ctoRecipient,
+        uint256 ctoTokenAmount,
+        uint256 ctoPairAmount,
         uint256 protocolTokenAmount,
-        uint256 protocolPairAmount
+        uint256 protocolPairAmount,
+        uint256 burnerTokenAmount,
+        uint256 burnerPairAmount
     );
-    event TreasuryUpdated(address treasury);
-    event ProtocolShareUpdated(uint16 protocolShareBps);
-    event TokenTreasuryShareUpdated(uint16 tokenTreasuryShareBps);
+    event RecipientsUpdated(address indexed protocolRecipient, address indexed burnerRecipient);
+    event ProtocolSplitterModeUpdated(bool enabled);
+    event SharesUpdated(uint16 protocolShareBps, uint16 burnerShareBps, uint16 ctoShareBps);
     event LockerUpdated(address locker);
 
     uint16 public constant MAX_BPS = 10_000;
+    uint16 public constant DEFAULT_PROTOCOL_SHARE_BPS = 3_333;
+    uint16 public constant DEFAULT_BURNER_SHARE_BPS = 3_333;
+    uint16 public constant DEFAULT_CTO_SHARE_BPS = 3_334;
 
-    address public immutable weth;
-    address public treasury;
+    address public protocolRecipient;
+    address public burnerRecipient;
     address public locker;
-    /// @notice Protocol share of pair-token (ETH) fees, in bps.
-    uint16 public protocolShare;
-    /// @notice Protocol share of launched-token fees, in bps.
-    uint16 public tokenTreasuryShare;
+    bool public protocolRecipientIsSplitter;
 
-    constructor(address weth_, address treasury_, uint16 protocolShare_, uint16 tokenTreasuryShare_)
-        Ownable(msg.sender)
-    {
-        if (weth_ == address(0) || treasury_ == address(0)) revert ZeroAddress();
-        if (protocolShare_ > MAX_BPS || tokenTreasuryShare_ > MAX_BPS) revert InvalidBasisPoints();
-        weth = weth_;
-        treasury = treasury_;
-        protocolShare = protocolShare_;
-        tokenTreasuryShare = tokenTreasuryShare_;
-    }
+    /// @notice Share paid to the fixed protocol recipient for each fee asset.
+    uint16 public protocolShareBps = DEFAULT_PROTOCOL_SHARE_BPS;
+    /// @notice Share paid to the fixed buy-burner recipient for each fee asset.
+    uint16 public burnerShareBps = DEFAULT_BURNER_SHARE_BPS;
+    /// @notice Share paid to the per-token CTO vault for each fee asset.
+    uint16 public ctoShareBps = DEFAULT_CTO_SHARE_BPS;
 
-    receive() external payable {}
+    constructor() Ownable(msg.sender) {}
 
-    function setTreasury(address treasury_) external onlyOwner {
-        if (treasury_ == address(0)) revert ZeroAddress();
-        treasury = treasury_;
-        emit TreasuryUpdated(treasury_);
-    }
+    /// @notice Atomically updates the two fixed recipients and the split applied
+    /// identically to both ERC20 fee assets. The per-token CTO recipient
+    /// continues to be supplied by the LauncherLocker.
+    function setFeeConfig(
+        address protocolRecipient_,
+        address burnerRecipient_,
+        uint16 protocolShareBps_,
+        uint16 burnerShareBps_,
+        uint16 ctoShareBps_
+    ) external onlyOwner {
+        if (protocolRecipient_ == address(0) || burnerRecipient_ == address(0)) {
+            revert ZeroAddress();
+        }
+        if (
+            protocolRecipient_ == burnerRecipient_ || protocolRecipient_ == address(this)
+                || burnerRecipient_ == address(this)
+        ) revert InvalidRecipient();
 
-    function setProtocolShare(uint16 bps) external onlyOwner {
-        if (bps > MAX_BPS) revert InvalidBasisPoints();
-        protocolShare = bps;
-        emit ProtocolShareUpdated(bps);
-    }
+        (bool protocolIsSplitter, address protocolSplitterSource) = _splitterBinding(protocolRecipient_);
+        if (protocolIsSplitter && protocolSplitterSource != address(this)) revert InvalidRecipient();
 
-    function setTokenTreasuryShare(uint16 bps) external onlyOwner {
-        if (bps > MAX_BPS) revert InvalidBasisPoints();
-        tokenTreasuryShare = bps;
-        emit TokenTreasuryShareUpdated(bps);
+        // The factory sends launch-fee WETH directly to this semantic slot.
+        // A FeeSplitter intentionally ignores raw transfers, so accepting one
+        // here would make every launch fee unallocated and unclaimable.
+        (bool burnerIsSplitter,) = _splitterBinding(burnerRecipient_);
+        if (burnerIsSplitter) revert InvalidRecipient();
+        if (uint256(protocolShareBps_) + burnerShareBps_ + ctoShareBps_ != MAX_BPS) {
+            revert InvalidBasisPoints();
+        }
+
+        protocolRecipient = protocolRecipient_;
+        burnerRecipient = burnerRecipient_;
+        protocolShareBps = protocolShareBps_;
+        burnerShareBps = burnerShareBps_;
+        ctoShareBps = ctoShareBps_;
+        protocolRecipientIsSplitter = protocolIsSplitter;
+
+        emit RecipientsUpdated(protocolRecipient_, burnerRecipient_);
+        emit ProtocolSplitterModeUpdated(protocolRecipientIsSplitter);
+        emit SharesUpdated(protocolShareBps_, burnerShareBps_, ctoShareBps_);
     }
 
     /// @notice One-time wiring of the locker (set at deployment).
@@ -81,36 +108,78 @@ contract FeeRouter is Ownable, ReentrancyGuard {
         emit LockerUpdated(locker_);
     }
 
-    /// @notice Distribute fees previously transferred to this contract by the locker.
+    /// @notice Distributes fees previously transferred to this contract by the locker.
     /// @dev Only callable by the locker, within the same tx as the collect.
-    function distribute(address token, address pairToken, uint256 tokenAmount, uint256 pairAmount, address feeWallet)
+    function distribute(address token, address pairToken, uint256 tokenAmount, uint256 pairAmount, address ctoRecipient)
         external
         nonReentrant
     {
         if (msg.sender != locker) revert NotLocker();
+        if (protocolRecipient == address(0) || burnerRecipient == address(0)) revert NotConfigured();
+        if (ctoRecipient == address(0)) revert ZeroAddress();
 
-        uint256 protocolTokenAmt = (tokenAmount * tokenTreasuryShare) / MAX_BPS;
-        uint256 creatorTokenAmt = tokenAmount - protocolTokenAmt;
-        uint256 protocolPairAmt = (pairAmount * protocolShare) / MAX_BPS;
-        uint256 creatorPairAmt = pairAmount - protocolPairAmt;
+        uint16 fixedRecipientShareBps = uint16(uint256(protocolShareBps) + burnerShareBps);
 
-        if (protocolTokenAmt > 0) IERC20(token).safeTransfer(treasury, protocolTokenAmt);
-        if (creatorTokenAmt > 0) IERC20(token).safeTransfer(feeWallet, creatorTokenAmt);
+        uint256 protocolTokenAmount = _mulBps(tokenAmount, protocolShareBps);
+        uint256 fixedRecipientTokenAmount = _mulBps(tokenAmount, fixedRecipientShareBps);
+        uint256 burnerTokenAmount = fixedRecipientTokenAmount - protocolTokenAmount;
+        uint256 ctoTokenAmount = tokenAmount - fixedRecipientTokenAmount;
 
-        if (pairToken == weth && pairAmount > 0) {
-            IWETH9(weth).withdraw(pairAmount);
-            if (protocolPairAmt > 0) _sendEth(treasury, protocolPairAmt);
-            if (creatorPairAmt > 0) _sendEth(feeWallet, creatorPairAmt);
-        } else {
-            if (protocolPairAmt > 0) IERC20(pairToken).safeTransfer(treasury, protocolPairAmt);
-            if (creatorPairAmt > 0) IERC20(pairToken).safeTransfer(feeWallet, creatorPairAmt);
-        }
+        uint256 protocolPairAmount = _mulBps(pairAmount, protocolShareBps);
+        uint256 fixedRecipientPairAmount = _mulBps(pairAmount, fixedRecipientShareBps);
+        uint256 burnerPairAmount = fixedRecipientPairAmount - protocolPairAmount;
+        uint256 ctoPairAmount = pairAmount - fixedRecipientPairAmount;
 
-        emit FeesDistributed(token, feeWallet, creatorTokenAmt, creatorPairAmt, protocolTokenAmt, protocolPairAmt);
+        _payFixedRecipient(token, protocolRecipient, protocolTokenAmount, protocolRecipientIsSplitter);
+        _payFixedRecipient(token, burnerRecipient, burnerTokenAmount, false);
+        if (ctoTokenAmount != 0) IERC20(token).safeTransfer(ctoRecipient, ctoTokenAmount);
+
+        _payFixedRecipient(pairToken, protocolRecipient, protocolPairAmount, protocolRecipientIsSplitter);
+        _payFixedRecipient(pairToken, burnerRecipient, burnerPairAmount, false);
+        if (ctoPairAmount != 0) IERC20(pairToken).safeTransfer(ctoRecipient, ctoPairAmount);
+
+        emit FeesDistributed(
+            token,
+            ctoRecipient,
+            ctoTokenAmount,
+            ctoPairAmount,
+            protocolTokenAmount,
+            protocolPairAmount,
+            burnerTokenAmount,
+            burnerPairAmount
+        );
     }
 
-    function _sendEth(address to, uint256 amount) private {
-        (bool ok,) = to.call{value: amount}("");
-        if (!ok) revert EthTransferFailed();
+    function _payFixedRecipient(address token, address recipient, uint256 amount, bool isSplitter) private {
+        if (amount == 0) return;
+
+        IERC20 asset = IERC20(token);
+        if (!isSplitter) {
+            asset.safeTransfer(recipient, amount);
+            return;
+        }
+
+        asset.forceApprove(recipient, amount);
+        IFeeSplitterRecipient(recipient).deposit(token, amount);
+        asset.forceApprove(recipient, 0);
+    }
+
+    function _splitterBinding(address recipient) private view returns (bool, address) {
+        if (recipient.code.length == 0) return (false, address(0));
+        try IFeeSplitterRecipient(recipient).feeRouter() returns (address source) {
+            try IFeeSplitterRecipient(recipient).currentEpoch() returns (uint256 epoch) {
+                return (epoch != 0, source);
+            } catch {
+                return (false, address(0));
+            }
+        } catch {
+            return (false, address(0));
+        }
+    }
+
+    /// @dev Equivalent to floor(amount * bps / MAX_BPS) without risking
+    /// overflow for arbitrary uint256 amounts.
+    function _mulBps(uint256 amount, uint16 bps) private pure returns (uint256) {
+        return (amount / MAX_BPS) * bps + ((amount % MAX_BPS) * bps) / MAX_BPS;
     }
 }

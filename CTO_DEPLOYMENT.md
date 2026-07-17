@@ -4,7 +4,7 @@ New launches use snapshot-backed, raw-balance voting and a dedicated EIP-1167 fe
 
 ## Deployment order
 
-1. Deploy `FeeRouter` and `LauncherLocker`.
+1. Deploy `FeeRouter` and `LauncherLocker`. The router remains unusable until its recipients are configured.
 2. Call `FeeRouter.setLocker(locker)` exactly once.
 3. Deploy `LaunchFactory(locker, launchFee, launchEnabled)`. Its constructor deploys the shared, initializer-locked `CTOFeeVault` implementation.
 4. Call `LauncherLocker.setFactory(factory)` exactly once.
@@ -16,7 +16,9 @@ New launches use snapshot-backed, raw-balance voting and a dedicated EIP-1167 fe
    ```
 
 7. Call `LaunchFactory.setCTOFund(proxy)` exactly once. The factory rejects the uninitialized implementation because its `factory()` value is not this factory.
-8. Put the proxy admin behind a timelocked multisig, configure launch/DEX settings, and enable launches.
+8. Deploy the burner and, if required, a `FeeSplitter` bound to the FeeRouter and owned by the intended multisig.
+   Atomically configure `FeeRouter` recipients/shares, put the owners and proxy admin behind multisigs, configure
+   launch/DEX settings, and enable launches.
 
 Every fee vault stores the proxy address as its permanent `ctoFund`. Upgrading the proxy therefore preserves vault authorization. The proxy admin controls a protocol-wide fee-authorization boundary and should be operationally separate from the functional owner that changes election parameters.
 
@@ -37,7 +39,7 @@ Every fee vault stores the proxy address as its permanent `ctoFund`. Upgrading t
   multi-sample oracle/commit design rather than an atomic permissionless snapshot.
 - `LaunchToken` records exact and end-of-opening-timestamp round boundaries for its aggregate
   one-way nonvoting supply, covering the factory, canonical pool, dead address, fee router, CTO vault, and every
-  treasury address used by that token without an unbounded loop. Ordinary transfers outside an opening boundary
+  fixed protocol/burner recipient used by that token without an unbounded loop. Ordinary transfers outside an opening boundary
   do not append historical checkpoints; state growth is tied to election rounds, not trading timestamps. The token
   enforces at most one snapshot per timestamp so each round has one unambiguous final boundary.
 - Each account may vote once per round; votes cannot be changed or withdrawn. Snapshot capping prevents transferred
@@ -53,14 +55,30 @@ Every fee vault stores the proxy address as its permanent `ctoFund`. Upgrading t
 - `claimTo` lets a nonpayable leader direct payment to a payable recipient.
 - Unclaimed fees follow the current leader, including fees accrued before a leadership change.
 - A vault accepts launched-token deposits only from the canonical `FeeRouter`. Direct holder deposits revert,
-  preventing excluded-balance parking and anti-snipe limit bypass; pair-token and native fee receipts are unchanged.
+  preventing excluded-balance parking and anti-snipe limit bypass. Pair-token fees remain ERC20s, including WETH;
+  the router never unwraps them.
+- An optional `FeeSplitter` may be used as the protocol router recipient. The burner slot remains a direct
+  recipient because it also receives the separate launch fee; `FeeRouter` rejects a bound splitter there.
+  The splitter receives the same restriction exemption and voting exclusion as an ordinary fixed protocol
+  recipient, but the factory does not inspect its binding or grant it fee-vault privileges: `feeDepositSource`
+  remains unset and `feeSenderExempt` remains false. Direct launched-token transfers are therefore possible but
+  unallocated, and claims that would exceed the temporary max-wallet limit must wait until restrictions expire.
+  Successful claims become ordinary circulating, vote-eligible balances.
+- The splitter owner (intended to be a multisig) may call `setConfig` to change recipients and shares. That closes
+  the current epoch and opens a new one for subsequent FeeRouter deposits; prior epoch recipients, shares,
+  deposits, and entitlements remain fixed, and each recipient can claim independently through
+  `release(epoch, token)`. A configuration applies when the router deposits collected fees, not when those fees
+  originally accrued in the V3 position. Collect pending fees immediately before an update if governance wants
+  that update to be a clean economic boundary.
+- A closed epoch's integer-division remainder is claimable by its last listed recipient. Direct ERC20 transfers to
+  the splitter are permitted but deliberately unallocated and create no recipient entitlement.
 
 The legacy `LaunchedToken.feeWallet` field remains the initial leader for ABI/indexer compatibility. `LaunchFactory.ctoVaultOf(token)` and `LauncherLocker.feeWalletOf(token)` identify the actual fee vault.
 
-If `FeeRouter.treasury` changes, call the permissionless `LaunchFactory.syncFeeTreasuryExemption(token)` to make
-the current treasury restriction-exempt immediately. Voting exclusion is deliberately synchronized by
-`ctoSnapshot` at the next round boundary, never midway through an active round. Prior treasuries remain excluded,
-and callers cannot select an arbitrary address.
+If either fixed FeeRouter recipient changes, `LauncherLocker.claimFees` automatically invokes the factory's
+permissionless `syncFeeRecipientExemptions(token)` before distributing. It can also be called directly. Voting
+exclusion is deliberately synchronized by `ctoSnapshot` at the next round boundary, never midway through an active
+round. Prior protocol and burner recipients remain excluded, and callers cannot select an arbitrary address.
 
 ## Build and test
 

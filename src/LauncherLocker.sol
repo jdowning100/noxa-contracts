@@ -8,10 +8,14 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {INonfungiblePositionManager} from "./interfaces/IUniswapV3.sol";
 import {FeeRouter} from "./FeeRouter.sol";
 
+interface IFeeRecipientSync {
+    function syncFeeRecipientExemptions(address token) external;
+}
+
 /// @notice Permanently holds LP NFTs for launched tokens. There is no withdraw
 /// path: liquidity is locked forever. Anyone may trigger a fee claim for a token;
-/// proceeds are split by the FeeRouter between the token's feeWallet and the
-/// protocol treasury.
+/// proceeds are split by the FeeRouter among the protocol, buy-burner, and the
+/// token's CTO fee vault.
 contract LauncherLocker is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -99,10 +103,15 @@ contract LauncherLocker is Ownable, ReentrancyGuard {
     }
 
     /// @notice Collect accrued LP fees for `token` and distribute via the FeeRouter.
-    /// Callable by anyone; funds always flow to feeWallet + treasury.
+    /// Callable by anyone; destinations are fixed by the router plus this token's CTO vault.
     function claimFees(address token) external nonReentrant returns (uint256 tokenAmount, uint256 pairAmount) {
         Position memory pos = positions[token];
         if (pos.positionManager == address(0)) revert UnknownToken();
+
+        // Recipient addresses are admin-configurable. Synchronize their
+        // restriction exemptions before transferring fees so a rotation cannot
+        // make max-wallet rules block collection during the launch window.
+        IFeeRecipientSync(factory).syncFeeRecipientExemptions(token);
 
         (uint256 amount0, uint256 amount1) = INonfungiblePositionManager(pos.positionManager)
             .collect(

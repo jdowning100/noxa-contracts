@@ -7,7 +7,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 
 /// @notice Immutable fee custody for one launched token.
 /// @dev The LauncherLocker should register this contract as the position's feeWallet. The existing
-///      FeeRouter then preserves Noxa's current fee split while sending the creator/community share here.
+///      FeeRouter sends the configured creator/community share of both ERC20 fee assets here.
 ///      There is deliberately no arbitrary-call or fee-redirect function: only the CTO election module
 ///      can release the known fee assets, so the original creator cannot bypass a later election.
 contract CTOFeeVault is ReentrancyGuard {
@@ -47,7 +47,8 @@ contract CTOFeeVault is ReentrancyGuard {
         emit Initialized(token_, pairToken_, ctoFund_);
     }
 
-    /// @notice Receives the creator/community share after FeeRouter unwraps a WETH pair.
+    /// @notice Retained for accidental native transfers and legacy recovery through the normal CTO claim path.
+    /// Current FeeRouter distributions keep WETH wrapped.
     receive() external payable {}
 
     /// @notice Releases every accrued known fee asset to a recipient selected by the current CTO leader.

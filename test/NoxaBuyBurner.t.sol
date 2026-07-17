@@ -5,8 +5,7 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {NoxaBuyBurner} from "../src/NoxaBuyBurner.sol";
-import {Noxa2Token} from "../src/Noxa2Token.sol";
-import {FeeRouter} from "../src/FeeRouter.sol";
+import {Noxa2Token} from "../NoxaToken.sol";
 import {LauncherLocker} from "../src/LauncherLocker.sol";
 import {LauncherTypes} from "../src/LauncherTypes.sol";
 import {LaunchFactory} from "../LaunchFactory_flat.sol";
@@ -26,12 +25,16 @@ interface VmFork {
     function stopPrank() external;
     function roll(uint256 newHeight) external;
     function warp(uint256 newTimestamp) external;
+    function expectRevert() external;
     function expectRevert(bytes4 revertData) external;
     function expectRevert(bytes calldata revertData) external;
 }
 
-interface IPoolOracleAdmin {
-    function increaseObservationCardinalityNext(uint16 observationCardinalityNext) external;
+/// @dev ABI for the already-deployed, pre-three-way FeeRouter used only by
+/// this legacy fork characterization suite.
+interface ILegacyFeeRouter {
+    function owner() external view returns (address);
+    function setTreasury(address treasury) external;
 }
 
 contract MockJunkToken is ERC20 {
@@ -89,18 +92,15 @@ contract NoxaBuyBurnerForkTest {
         // after deployment; tests mint a fresh stand-in (1M supply to us).
         noxa = address(new Noxa2Token(address(this), "", "", Noxa2Token.Socials("", "", "", "", "")));
 
-        // Seed a NOXA/WETH pool at the launcher tier (1:1 for test simplicity)
-        // and make its oracle strict-caller-ready: grow cardinality and
-        // populate observations across blocks, then let a full window elapse.
+        // Seed a NOXA/WETH pool at the launcher tier (1:1 for test simplicity).
         vm.deal(address(this), 1_000_000 ether);
         IWETH9(WETH).deposit{value: 400_000 ether}();
         burnPool = _createPool(LAUNCH_FEE_TIER, 300_000 ether, -200_000, 200_000);
-        _makeOracleReady(burnPool);
         burner.setBurnTarget(noxa, burnPool);
 
         // Repoint the protocol treasury at the burner (owner-only, live owner).
-        vm.prank(FeeRouter(FEE_ROUTER).owner());
-        FeeRouter(FEE_ROUTER).setTreasury(address(burner));
+        vm.prank(ILegacyFeeRouter(FEE_ROUTER).owner());
+        ILegacyFeeRouter(FEE_ROUTER).setTreasury(address(burner));
 
         // Launch a token through the live factory; the launch fee must land in
         // the burner via its bare receive().
@@ -117,8 +117,9 @@ contract NoxaBuyBurnerForkTest {
         ethAfterLaunch = address(burner).balance;
 
         // Trade both directions past the anti-snipe window so LP fees accrue
-        // in WETH and in the launched token, then claim: FeeRouter unwraps the
-        // burner's pair share to native ETH and sends the token share raw.
+        // in WETH and in the launched token, then claim. This suite targets the
+        // legacy live router, which unwraps WETH; current-router ERC20-only
+        // behavior is covered by FeeRouterTest and NoxaFactoryIntegrationTest.
         vm.roll(block.number + 400);
         uint256 bought = _poolSwap(launchedPool, WETH, 5 ether);
         _poolSwap(launchedPool, launched, bought / 2);
@@ -187,6 +188,34 @@ contract NoxaBuyBurnerForkTest {
         require(burner.lastBurnAt() == lastBurnBefore, "partial fill must not re-arm public cooldown");
     }
 
+    // A zero-WETH burn must NOT re-arm the public-burn cooldown: otherwise a
+    // front-runner could re-lock the public fallback for another
+    // PUBLIC_BURN_DELAY the instant the window opens, by calling burn() while
+    // the contract holds no WETH (wethIn == wethBalance == 0).
+    function test_burn_emptyBalance_doesNotRearmPublicCooldown() public {
+        NoxaBuyBurner empty = new NoxaBuyBurner(V3_FACTORY, WETH, FACTORY, address(this));
+        empty.setBurnTarget(noxa, burnPool);
+        require(
+            IERC20(WETH).balanceOf(address(empty)) == 0 && address(empty).balance == 0, "burner must start empty"
+        );
+
+        uint256 armedAt = empty.lastBurnAt(); // set at construction
+        vm.warp(block.timestamp + empty.PUBLIC_BURN_DELAY() + 1); // open the public window
+
+        // Empty burn by a stranger: no swap happens (no anchor needed), nothing
+        // is burned, and — post-fix — the cooldown clock is untouched.
+        vm.prank(STRANGER);
+        uint256 burned = empty.burn();
+        require(burned == 0, "empty burn destroys nothing");
+        require(empty.lastBurnAt() == armedAt, "empty burn must not re-arm the public cooldown");
+
+        // The window therefore stays open — a stranger can still burn again
+        // immediately (no spurious 2-day re-lock from the empty call).
+        vm.prank(STRANGER);
+        empty.burn();
+        require(empty.lastBurnAt() == armedAt, "second empty burn still must not re-arm");
+    }
+
     // ---------------------------------------------------------------- pool trust
 
     function test_publicSweep_cannotChoosePool_usesOfficialMapping() public {
@@ -215,27 +244,79 @@ contract NoxaBuyBurnerForkTest {
         require(out > 0, "owner explicit-pool sweep");
     }
 
-    // ---------------------------------------------------------------- oracle gate
+    // ---------------------------------------------------------------- anchor gate
 
-    function test_publicSweep_revertsWithoutOracle() public {
-        // Fresh launch pools have observation cardinality 1: untrusted
-        // callers must not fall back to manipulable spot.
+    function test_publicSweep_revertsWithoutAnchor() public {
+        // No recorded anchor: untrusted callers must not price off spot.
         vm.prank(STRANGER);
-        vm.expectRevert(NoxaBuyBurner.OracleNotReady.selector);
+        vm.expectRevert(NoxaBuyBurner.AnchorNotReady.selector);
         burner.sweepToken(launched);
     }
 
-    function test_ownerSweep_toleratesSpotFallback() public {
-        uint256 out = burner.sweepToken(launched); // owner: spot anchor allowed
-        require(out > 0, "owner sweep works without oracle history");
+    function test_publicSweep_immatureAnchorReverts_maturedAnchorWorks() public {
+        vm.prank(STRANGER);
+        burner.recordAnchor(launchedPool);
+
+        // Same-block (and any pre-delay) execution is blocked.
+        vm.prank(STRANGER);
+        vm.expectRevert(NoxaBuyBurner.AnchorNotReady.selector);
+        burner.sweepToken(launched);
+
+        // After the delay the anchor is usable by anyone.
+        vm.roll(block.number + 1);
+        vm.warp(block.timestamp + burner.anchorDelay() + 1);
+        vm.prank(STRANGER);
+        uint256 out = burner.sweepToken(launched);
+        require(out > 0, "matured-anchor public sweep executes");
     }
 
-    function test_publicBurn_revertsWithoutOracle() public {
-        address thin = _createPool(3000, 50 ether, -60_000, 60_000); // cardinality 1
-        burner.setBurnTarget(noxa, thin);
+    function test_publicSweep_atomicManipulation_cannotExtractInventory() public {
+        // The reviewer's attack: manipulate spot around both the record and
+        // the execution moments, holding nothing in between. With cumulative
+        // anchors the average is time-weighted, so the atomic crash carries
+        // ~zero weight: the anchor stays honest and the pool now sits far
+        // below (anchor - drift), making the sweep revert (SPL) instead of
+        // selling the inventory at the hostile price.
+        burner.recordAnchor(launchedPool);
+        vm.roll(block.number + 1);
+        vm.warp(block.timestamp + burner.anchorDelay() + 1);
+
+        // Attacker crashes the launched token's price in one shot.
+        uint256 attackerTokens = IERC20(launched).balanceOf(address(this));
+        _poolSwap(launchedPool, launched, attackerTokens);
+
+        vm.prank(STRANGER);
+        vm.expectRevert(); // pool rejects the out-of-bounds price limit
+        burner.sweepToken(launched);
+    }
+
+    function test_anchor_expiresAndIsRerecordable_notOverwritableWhileLive() public {
+        burner.recordAnchor(launchedPool);
+
+        // A live (pending or usable) anchor cannot be replaced.
+        vm.expectRevert(NoxaBuyBurner.AnchorPending.selector);
+        burner.recordAnchor(launchedPool);
+        vm.warp(block.timestamp + burner.anchorDelay() + 1);
+        vm.expectRevert(NoxaBuyBurner.AnchorPending.selector);
+        burner.recordAnchor(launchedPool);
+
+        // Past validity it is stale: unusable, but re-recordable.
+        vm.warp(block.timestamp + burner.anchorValidity() + 1);
+        vm.prank(STRANGER);
+        vm.expectRevert(NoxaBuyBurner.AnchorNotReady.selector);
+        burner.sweepToken(launched);
+        burner.recordAnchor(launchedPool);
+    }
+
+    function test_ownerSweep_pricesOffSpot_noAnchorNeeded() public {
+        uint256 out = burner.sweepToken(launched); // owner: spot anchor allowed
+        require(out > 0, "owner sweep works without an anchor");
+    }
+
+    function test_publicBurn_revertsWithoutAnchor() public {
         vm.warp(block.timestamp + burner.PUBLIC_BURN_DELAY() + 1);
         vm.prank(STRANGER);
-        vm.expectRevert(NoxaBuyBurner.OracleNotReady.selector);
+        vm.expectRevert(NoxaBuyBurner.AnchorNotReady.selector);
         burner.burn();
     }
 
@@ -247,9 +328,10 @@ contract NoxaBuyBurnerForkTest {
         vm.expectRevert(NoxaBuyBurner.BurnLocked.selector);
         burner.burn();
 
-        // After the delay, anyone may burn (burn pool is oracle-ready); the
+        // After the delay, anyone may burn against a matured anchor; the
         // complete burn re-arms the window so the next attempt is blocked.
         vm.warp(block.timestamp + burner.PUBLIC_BURN_DELAY() + 1);
+        _matureAnchor(burnPool);
         vm.prank(STRANGER);
         uint256 burned = burner.burn();
         require(burned > 0, "public fallback burn executes");
@@ -260,7 +342,9 @@ contract NoxaBuyBurnerForkTest {
 
     function test_burn_permissionlessAfterOwnershipRenounced() public {
         burner.renounceOwnership();
-        // No delay gate anymore: back-to-back public burns both execute.
+        _matureAnchor(burnPool);
+        // No delay gate anymore: back-to-back public burns both execute
+        // while the anchor stays valid.
         vm.prank(STRANGER);
         uint256 burned = burner.burn();
         require(burned > 0, "ownerless burn executes immediately");
@@ -304,17 +388,19 @@ contract NoxaBuyBurnerForkTest {
         vm.expectRevert(unauthorized);
         burner.setBurnTarget(noxa, burnPool);
         vm.expectRevert(unauthorized);
-        burner.setSwapGuard(60, 100, 8);
+        burner.setSwapGuard(300, 3600, 300);
         vm.expectRevert(unauthorized);
         burner.rescueToken(noxa, STRANGER, 1);
         vm.stopPrank();
     }
 
-    function test_setSwapGuard_rejectsSpotOnlyConfig() public {
+    function test_setSwapGuard_rejectsDegenerateConfig() public {
         vm.expectRevert(NoxaBuyBurner.InvalidGuardConfig.selector);
-        burner.setSwapGuard(0, 300, 8); // twapWindow 0 would disable the oracle
+        burner.setSwapGuard(30, 3600, 300); // sub-minute delay defeats the commit step
         vm.expectRevert(NoxaBuyBurner.InvalidGuardConfig.selector);
-        burner.setSwapGuard(1800, 300, 1); // cardinality 1 degenerates to spot
+        burner.setSwapGuard(300, 300, 300); // validity must exceed the delay
+        vm.expectRevert(NoxaBuyBurner.InvalidGuardConfig.selector);
+        burner.setSwapGuard(300, 3600, 0); // zero drift blocks every swap
     }
 
     function test_rescueToken() public {
@@ -351,17 +437,12 @@ contract NoxaBuyBurnerForkTest {
         );
     }
 
-    /// @dev Grow a pool's observation ring and populate it with one write per
-    /// block, then let a full TWAP window elapse so strict callers pass.
-    function _makeOracleReady(address pool) internal {
-        IPoolOracleAdmin(pool).increaseObservationCardinalityNext(12);
-        for (uint256 i = 0; i < 12; i++) {
-            vm.roll(block.number + 1);
-            vm.warp(block.timestamp + 300);
-            _poolSwap(pool, WETH, 0.01 ether);
-        }
+    /// @dev Record a price anchor for `pool` and age it past the delay so
+    /// untrusted callers can swap against it.
+    function _matureAnchor(address pool) internal {
+        burner.recordAnchor(pool);
         vm.roll(block.number + 1);
-        vm.warp(block.timestamp + 1801);
+        vm.warp(block.timestamp + burner.anchorDelay() + 1);
     }
 
     /// @dev Direct exact-input pool swap from the test; callback below pays.

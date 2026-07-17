@@ -92,11 +92,7 @@ contract LaunchFactory is Ownable, ReentrancyGuard, IUniswapV3SwapCallback {
     event WhitelistedLauncherUpdated(address indexed launcher, bool allowed);
     event CTOFundConfigured(address indexed ctoFund);
     event CTOFeeVaultCreated(address indexed token, address indexed vault, address indexed initialLeader);
-    event FeeTreasuryRestrictionExempted(address indexed token, address indexed treasury);
-
-    /// @dev Oracle ring-buffer slots pre-warmed on every launch pool (~20k gas
-    /// each, paid by the launcher) so strict TWAP consumers work permissionlessly.
-    uint16 internal constant OBSERVATION_CARDINALITY = 8;
+    event FeeRecipientRestrictionExempted(address indexed token, address indexed recipient);
 
     LauncherLocker public immutable locker;
     address public immutable ctoVaultImplementation;
@@ -217,20 +213,16 @@ contract LaunchFactory is Ownable, ReentrancyGuard, IUniswapV3SwapCallback {
         if (msg.sender != address(ctoFund)) revert OnlyCTOFund();
         if (launchedTokens[token].token == address(0)) revert UnknownToken();
         LaunchToken launchTokenContract = LaunchToken(token);
-        address treasury = locker.feeRouter().treasury();
-        launchTokenContract.setRestrictionExempt(treasury);
-        launchTokenContract.setVotingExcluded(treasury);
+        _syncFeeRecipients(launchTokenContract, true);
         snapshotId = launchTokenContract.snapshot();
     }
 
-    /// @notice Refreshes anti-snipe treatment immediately after FeeRouter's treasury changes.
+    /// @notice Refreshes anti-snipe treatment after either fixed FeeRouter recipient changes.
     /// @dev Permissionless and fixed-destination: callers cannot choose which account becomes exempt.
     /// Voting exclusion is applied atomically at the next CTO snapshot, never halfway through a round.
-    function syncFeeTreasuryExemption(address token) external {
+    function syncFeeRecipientExemptions(address token) external {
         if (launchedTokens[token].token == address(0)) revert UnknownToken();
-        address treasury = locker.feeRouter().treasury();
-        LaunchToken(token).setRestrictionExempt(treasury);
-        emit FeeTreasuryRestrictionExempted(token, treasury);
+        _syncFeeRecipients(LaunchToken(token), false);
     }
 
     // ---------------------------------------------------------------- launch
@@ -293,8 +285,12 @@ contract LaunchFactory is Ownable, ReentrancyGuard, IUniswapV3SwapCallback {
         _emitTokenMetadata(token, params);
 
         if (launchFee > 0) {
-            (bool ok,) = address(locker.feeRouter().treasury()).call{value: launchFee}("");
-            if (!ok) revert FeeTransferFailed();
+            // The anti-spam launch fee remains separate from the LP-fee split,
+            // but all payouts stay ERC20: wrap it and fund the burner in WETH.
+            IWETH9(cfg.pairToken).deposit{value: launchFee}();
+            if (!IWETH9(cfg.pairToken).transfer(locker.feeRouter().burnerRecipient(), launchFee)) {
+                revert FeeTransferFailed();
+            }
         }
 
         if (runtime.initialBuyAmount > 0) {
@@ -361,18 +357,9 @@ contract LaunchFactory is Ownable, ReentrancyGuard, IUniswapV3SwapCallback {
         pool = pm.createAndInitializePoolIfNecessary(
             token0, token1, dex.poolFee, TickMath.getSqrtRatioAtTick(initialTick)
         );
-        // Pre-warm the oracle ring buffer so the pool can serve TWAPs once
-        // trades populate it. Fresh V3 pools store a single observation, which
-        // is useless as a manipulation-resistant anchor; the buy-burner (and
-        // any other strict consumer) requires real history before allowing
-        // permissionless swaps through the pool. Idempotent and grow-only, so
-        // relaunches against a pre-existing pool can never shrink it.
-        IUniswapV3Pool(pool).increaseObservationCardinalityNext(OBSERVATION_CARDINALITY);
-
         LaunchToken lt = LaunchToken(token);
         lt.setVotingExcluded(pool);
         lt.setVotingExcluded(address(locker.feeRouter()));
-        lt.setVotingExcluded(locker.feeRouter().treasury());
         lt.setRestrictionExempt(pool);
         lt.setRestrictionExempt(address(locker));
         lt.setRestrictionExempt(dex.positionManager);
@@ -382,7 +369,7 @@ contract LaunchFactory is Ownable, ReentrancyGuard, IUniswapV3SwapCallback {
         lt.setRestrictionExempt(feeWallet);
         lt.configureFeeVault(feeWallet, address(locker.feeRouter()));
         lt.setRestrictionExempt(address(locker.feeRouter()));
-        lt.setRestrictionExempt(locker.feeRouter().treasury());
+        _syncFeeRecipients(lt, true);
 
         lt.approve(dex.positionManager, cfg.supply);
 
@@ -413,6 +400,24 @@ contract LaunchFactory is Ownable, ReentrancyGuard, IUniswapV3SwapCallback {
         uint256 dust = lt.balanceOf(address(this));
         if (dust > 0 && !lt.transfer(0x000000000000000000000000000000000000dEaD, dust)) {
             revert TokenTransferFailed();
+        }
+    }
+
+    function _syncFeeRecipients(LaunchToken token, bool excludeFromVoting) private {
+        address protocolRecipient = locker.feeRouter().protocolRecipient();
+        address burnerRecipient = locker.feeRouter().burnerRecipient();
+        if (protocolRecipient == address(0) || burnerRecipient == address(0)) revert ZeroAddress();
+
+        token.setRestrictionExempt(protocolRecipient);
+        emit FeeRecipientRestrictionExempted(address(token), protocolRecipient);
+        if (burnerRecipient != protocolRecipient) {
+            token.setRestrictionExempt(burnerRecipient);
+            emit FeeRecipientRestrictionExempted(address(token), burnerRecipient);
+        }
+
+        if (excludeFromVoting) {
+            token.setVotingExcluded(protocolRecipient);
+            if (burnerRecipient != protocolRecipient) token.setVotingExcluded(burnerRecipient);
         }
     }
 

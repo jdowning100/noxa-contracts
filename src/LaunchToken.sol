@@ -36,7 +36,7 @@ contract LaunchToken is ERC20 {
     mapping(address => bool) public votingExcluded;
 
     /// @notice First snapshot id at which an account is nonvoting (zero means never excluded).
-    /// @dev This keeps historical round views stable even after a treasury is excluded in a later round.
+    /// @dev This keeps historical round views stable even after a protocol recipient is excluded in a later round.
     mapping(address => uint256) public votingExcludedFromSnapshotId;
 
     /// @notice Fixed fee-distribution contracts allowed to pay accrued launched tokens without a recipient

@@ -6,6 +6,7 @@ import {LaunchToken} from "../src/LaunchToken.sol";
 import {LauncherLocker} from "../src/LauncherLocker.sol";
 import {LauncherTypes} from "../src/LauncherTypes.sol";
 import {FeeRouter} from "../src/FeeRouter.sol";
+import {FeeSplitter} from "../src/FeeSplitter.sol";
 import {NoxaCTOFund} from "../src/NoxaCTOFund.sol";
 import {CTOFeeVault} from "../src/CTOFeeVault.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
@@ -16,6 +17,7 @@ interface VmIntegration {
     function deal(address account, uint256 newBalance) external;
     function expectRevert(bytes4 revertData) external;
     function prank(address caller) external;
+    function roll(uint256 newHeight) external;
 }
 
 contract IntegrationProxy {
@@ -94,13 +96,6 @@ contract MockV3Pool {
 
     function slot0() external pure returns (uint160, int24, uint16, uint16, uint16, uint8, bool) {
         return (uint160(1 << 96), 0, 0, 0, 0, 0, true);
-    }
-
-    /// @dev Records the factory's launch-time oracle pre-warm request.
-    uint16 public observationCardinalityNext;
-
-    function increaseObservationCardinalityNext(uint16 value) external {
-        if (value > observationCardinalityNext) observationCardinalityNext = value;
     }
 
     function swap(address, bool, int256, uint160, bytes calldata) external pure returns (int256, int256) {
@@ -243,8 +238,11 @@ contract NoxaFactoryIntegrationTest {
 
     uint256 private constant SUPPLY = 1_000_000 ether;
     address private constant DEV_WALLET = address(0xD3E);
-    address private constant TREASURY = address(0x7EA5);
+    address private constant PROTOCOL_RECIPIENT = address(0x7EA5);
+    address private constant BURNER_RECIPIENT = address(0xB012);
     address private constant CLAIM_RECIPIENT = address(0xCA11);
+    address private constant SPLIT_RECIPIENT_A = address(0xA700);
+    address private constant SPLIT_RECIPIENT_B = address(0xB700);
 
     MockWETH private weth;
     MockPositionManager private positionManager;
@@ -259,7 +257,8 @@ contract NoxaFactoryIntegrationTest {
         vm.deal(address(this), 100 ether);
         weth = new MockWETH();
         positionManager = new MockPositionManager();
-        feeRouter = new FeeRouter(address(weth), TREASURY, 2_000, 3_000);
+        feeRouter = new FeeRouter();
+        feeRouter.setFeeConfig(PROTOCOL_RECIPIENT, BURNER_RECIPIENT, 3_333, 3_333, 3_334);
         locker = new LauncherLocker(payable(address(feeRouter)));
         feeRouter.setLocker(address(locker));
 
@@ -306,11 +305,6 @@ contract NoxaFactoryIntegrationTest {
 
         _assertEq(launched.feeWallet, DEV_WALLET, "legacy feeWallet changed");
         _assertEq(locker.feeWalletOf(token), vault, "locker not routed to vault");
-        _assertEq(
-            uint256(MockV3Pool(launched.pool).observationCardinalityNext()),
-            8,
-            "launch pool oracle buffer not pre-warmed"
-        );
         _assertEq(ctoFund.leader(token), DEV_WALLET, "initial leader");
         _assertEq(CTOFeeVault(payable(vault)).token(), token, "vault token");
         _assertEq(CTOFeeVault(payable(vault)).pairToken(), address(weth), "vault pair");
@@ -322,12 +316,14 @@ contract NoxaFactoryIntegrationTest {
         _assertTrue(launchToken.votingExcluded(launched.pool), "pool can vote");
         _assertTrue(launchToken.votingExcluded(vault), "vault can vote");
         _assertTrue(launchToken.votingExcluded(address(feeRouter)), "router can vote");
-        _assertTrue(launchToken.votingExcluded(TREASURY), "treasury can vote");
+        _assertTrue(launchToken.votingExcluded(PROTOCOL_RECIPIENT), "protocol can vote");
+        _assertTrue(launchToken.votingExcluded(BURNER_RECIPIENT), "burner can vote");
         _assertTrue(launchToken.restrictionExempt(vault), "vault restriction");
         _assertTrue(launchToken.feeSenderExempt(vault), "vault fee sender");
         _assertEq(launchToken.feeDepositSource(vault), address(feeRouter), "vault deposit source");
         _assertTrue(launchToken.restrictionExempt(address(feeRouter)), "router restriction");
-        _assertTrue(launchToken.restrictionExempt(TREASURY), "treasury restriction");
+        _assertTrue(launchToken.restrictionExempt(PROTOCOL_RECIPIENT), "protocol restriction");
+        _assertTrue(launchToken.restrictionExempt(BURNER_RECIPIENT), "burner restriction");
         _assertEq(launchToken.balanceOf(launched.pool), SUPPLY, "pool inventory");
     }
 
@@ -349,25 +345,251 @@ contract NoxaFactoryIntegrationTest {
         vm.prank(address(0xB0B));
         locker.claimFees(token);
 
-        uint256 protocolToken = (uint256(tokenFees) * 3_000) / 10_000;
-        uint256 leaderToken = uint256(tokenFees) - protocolToken;
-        uint256 protocolNative = (uint256(pairFees) * 2_000) / 10_000;
-        uint256 leaderNative = uint256(pairFees) - protocolNative;
+        uint256 protocolToken = (uint256(tokenFees) * 3_333) / 10_000;
+        uint256 burnerToken = (uint256(tokenFees) * 3_333) / 10_000;
+        uint256 leaderToken = uint256(tokenFees) - protocolToken - burnerToken;
+        uint256 protocolPair = (uint256(pairFees) * 3_333) / 10_000;
+        uint256 burnerPair = (uint256(pairFees) * 3_333) / 10_000;
+        uint256 leaderPair = uint256(pairFees) - protocolPair - burnerPair;
 
-        _assertEq(LaunchToken(token).balanceOf(TREASURY), protocolToken, "protocol token split");
+        _assertEq(LaunchToken(token).balanceOf(PROTOCOL_RECIPIENT), protocolToken, "protocol token split");
+        _assertEq(LaunchToken(token).balanceOf(BURNER_RECIPIENT), burnerToken, "burner token split");
         _assertEq(LaunchToken(token).balanceOf(vault), leaderToken, "vault token split");
         _assertEq(LaunchToken(token).votingExcludedSupply(), SUPPLY, "fee inventory became circulating");
-        _assertEq(TREASURY.balance, protocolNative, "protocol native split");
-        _assertEq(vault.balance, leaderNative, "vault native split");
+        _assertEq(weth.balanceOf(PROTOCOL_RECIPIENT), protocolPair, "protocol WETH split");
+        _assertEq(weth.balanceOf(BURNER_RECIPIENT), burnerPair, "burner WETH split");
+        _assertEq(weth.balanceOf(vault), leaderPair, "vault WETH split");
+        _assertEq(PROTOCOL_RECIPIENT.balance, 0, "protocol received native");
+        _assertEq(BURNER_RECIPIENT.balance, 0, "burner received native");
+        _assertEq(vault.balance, 0, "vault received native");
 
         vm.prank(DEV_WALLET);
         ctoFund.claimTo(token, CLAIM_RECIPIENT);
 
         _assertEq(LaunchToken(token).balanceOf(CLAIM_RECIPIENT), leaderToken, "claimed token");
         _assertEq(LaunchToken(token).votingExcludedSupply(), SUPPLY - leaderToken, "claimed token stayed nonvoting");
-        _assertEq(CLAIM_RECIPIENT.balance, leaderNative, "claimed native");
+        _assertEq(weth.balanceOf(CLAIM_RECIPIENT), leaderPair, "claimed WETH");
+        _assertEq(CLAIM_RECIPIENT.balance, 0, "claim unexpectedly unwrapped WETH");
         _assertEq(LaunchToken(token).balanceOf(vault), 0, "vault token remains");
-        _assertEq(vault.balance, 0, "vault native remains");
+        _assertEq(weth.balanceOf(vault), 0, "vault WETH remains");
+    }
+
+    function testLaunchFeeIsWrappedAndSentToBurnerAsWeth() public {
+        uint256 fee = 0.5 ether;
+        factory.setLaunchFee(fee);
+
+        uint256 burnerNativeBefore = BURNER_RECIPIENT.balance;
+        (address token,) = _launchWithValue(fee);
+        address vault = factory.ctoVaultOf(token);
+
+        _assertEq(weth.balanceOf(BURNER_RECIPIENT), fee, "burner missing wrapped launch fee");
+        _assertEq(weth.balanceOf(PROTOCOL_RECIPIENT), 0, "launch fee entered protocol split");
+        _assertEq(weth.balanceOf(vault), 0, "launch fee entered CTO split");
+        _assertEq(BURNER_RECIPIENT.balance, burnerNativeBefore, "burner received native launch fee");
+        _assertEq(address(factory).balance, 0, "factory retained native launch fee");
+        _assertEq(address(feeRouter).balance, 0, "router retained native launch fee");
+    }
+
+    function testFeeSplitterCanSubdivideAndReconfigureFutureTokenAndWethFees() public {
+        address[] memory recipients = new address[](2);
+        recipients[0] = SPLIT_RECIPIENT_A;
+        recipients[1] = SPLIT_RECIPIENT_B;
+        uint16[] memory shares = new uint16[](2);
+        shares[0] = 6_000;
+        shares[1] = 4_000;
+        FeeSplitter splitter = new FeeSplitter(address(feeRouter), address(this), recipients, shares);
+
+        feeRouter.setFeeConfig(address(splitter), BURNER_RECIPIENT, 3_333, 3_333, 3_334);
+        (address token, uint256 positionId) = _launch();
+        LauncherTypes.LaunchedToken memory launched = factory.getLaunchedToken(token);
+
+        _assertTrue(LaunchToken(token).restrictionExempt(address(splitter)), "splitter restriction");
+        _assertTrue(LaunchToken(token).votingExcluded(address(splitter)), "splitter can vote");
+        _assertTrue(!LaunchToken(token).feeSenderExempt(address(splitter)), "splitter got fee-sender privilege");
+        _assertEq(LaunchToken(token).feeDepositSource(address(splitter)), address(0), "splitter got deposit privilege");
+
+        uint128 tokenFees = uint128(900 ether);
+        uint128 pairFees = uint128(9 ether);
+        weth.deposit{value: pairFees}();
+        require(weth.transfer(launched.pool, pairFees), "PAIR_TO_POOL");
+        MockV3Pool(launched.pool).approveToken(token, address(positionManager), tokenFees);
+        MockV3Pool(launched.pool).approveToken(address(weth), address(positionManager), pairFees);
+        (uint128 amount0, uint128 amount1) = launched.isToken0 ? (tokenFees, pairFees) : (pairFees, tokenFees);
+        positionManager.accrueFrom(positionId, launched.pool, amount0, amount1);
+
+        locker.claimFees(token);
+
+        uint256 protocolToken = (uint256(tokenFees) * 3_333) / 10_000;
+        uint256 protocolPair = (uint256(pairFees) * 3_333) / 10_000;
+        _assertEq(LaunchToken(token).balanceOf(address(splitter)), protocolToken, "splitter token receipt");
+        _assertEq(weth.balanceOf(address(splitter)), protocolPair, "splitter WETH receipt");
+        _assertEq(splitter.epochDeposited(1, token), protocolToken, "epoch one token deposit");
+        _assertEq(splitter.epochDeposited(1, address(weth)), protocolPair, "epoch one WETH deposit");
+        _assertEq(LaunchToken(token).votingExcludedSupply(), SUPPLY, "splitter receipt entered circulation");
+
+        uint256 oldATokenEntitlement = splitter.releasable(1, token, SPLIT_RECIPIENT_A);
+        uint256 oldBTokenEntitlement = splitter.releasable(1, token, SPLIT_RECIPIENT_B);
+        uint256 oldAPairEntitlement = splitter.releasable(1, address(weth), SPLIT_RECIPIENT_A);
+        uint256 oldBPairEntitlement = splitter.releasable(1, address(weth), SPLIT_RECIPIENT_B);
+
+        // These fees accrue in the LP position before the owner changes the
+        // split, but FeeSplitter assigns them when FeeRouter later deposits.
+        uint128 nextTokenFees = uint128(600 ether);
+        uint128 nextPairFees = uint128(6 ether);
+        weth.deposit{value: nextPairFees}();
+        require(weth.transfer(launched.pool, nextPairFees), "NEXT_PAIR_TO_POOL");
+        MockV3Pool(launched.pool).approveToken(token, address(positionManager), nextTokenFees);
+        MockV3Pool(launched.pool).approveToken(address(weth), address(positionManager), nextPairFees);
+        (amount0, amount1) = launched.isToken0 ? (nextTokenFees, nextPairFees) : (nextPairFees, nextTokenFees);
+        positionManager.accrueFrom(positionId, launched.pool, amount0, amount1);
+
+        shares[0] = 2_500;
+        shares[1] = 7_500;
+        splitter.setConfig(recipients, shares);
+
+        _assertEq(splitter.currentEpoch(), 2, "new splitter epoch not opened");
+        _assertTrue(splitter.epochClosed(1), "old splitter epoch not closed");
+        _assertEq(
+            splitter.releasable(1, token, SPLIT_RECIPIENT_A), oldATokenEntitlement, "old A token entitlement changed"
+        );
+        _assertEq(
+            splitter.releasable(1, token, SPLIT_RECIPIENT_B), oldBTokenEntitlement, "old B token entitlement changed"
+        );
+        _assertEq(
+            splitter.releasable(1, address(weth), SPLIT_RECIPIENT_A),
+            oldAPairEntitlement,
+            "old A WETH entitlement changed"
+        );
+        _assertEq(
+            splitter.releasable(1, address(weth), SPLIT_RECIPIENT_B),
+            oldBPairEntitlement,
+            "old B WETH entitlement changed"
+        );
+
+        locker.claimFees(token);
+
+        uint256 nextProtocolToken = (uint256(nextTokenFees) * 3_333) / 10_000;
+        uint256 nextProtocolPair = (uint256(nextPairFees) * 3_333) / 10_000;
+        _assertEq(splitter.epochDeposited(1, token), protocolToken, "old token epoch changed");
+        _assertEq(splitter.epochDeposited(1, address(weth)), protocolPair, "old WETH epoch changed");
+        _assertEq(splitter.epochDeposited(2, token), nextProtocolToken, "future token deposit missed new epoch");
+        _assertEq(splitter.epochDeposited(2, address(weth)), nextProtocolPair, "future WETH deposit missed new epoch");
+
+        vm.prank(SPLIT_RECIPIENT_A);
+        splitter.release(1, token);
+        vm.prank(SPLIT_RECIPIENT_B);
+        splitter.release(1, token);
+        vm.prank(SPLIT_RECIPIENT_A);
+        splitter.release(1, address(weth));
+        vm.prank(SPLIT_RECIPIENT_B);
+        splitter.release(1, address(weth));
+        vm.prank(SPLIT_RECIPIENT_A);
+        splitter.release(2, token);
+        vm.prank(SPLIT_RECIPIENT_B);
+        splitter.release(2, token);
+        vm.prank(SPLIT_RECIPIENT_A);
+        splitter.release(2, address(weth));
+        vm.prank(SPLIT_RECIPIENT_B);
+        splitter.release(2, address(weth));
+
+        uint256 recipientAToken = oldATokenEntitlement + (nextProtocolToken * 2_500) / 10_000;
+        uint256 recipientBToken = oldBTokenEntitlement + (nextProtocolToken * 7_500) / 10_000;
+        uint256 recipientAPair = oldAPairEntitlement + (nextProtocolPair * 2_500) / 10_000;
+        uint256 recipientBPair = oldBPairEntitlement + (nextProtocolPair * 7_500) / 10_000;
+        _assertEq(LaunchToken(token).balanceOf(SPLIT_RECIPIENT_A), recipientAToken, "recipient A token");
+        _assertEq(LaunchToken(token).balanceOf(SPLIT_RECIPIENT_B), recipientBToken, "recipient B token");
+        _assertEq(weth.balanceOf(SPLIT_RECIPIENT_A), recipientAPair, "recipient A WETH");
+        _assertEq(weth.balanceOf(SPLIT_RECIPIENT_B), recipientBPair, "recipient B WETH");
+        _assertEq(splitter.totalRecorded(token), protocolToken + nextProtocolToken, "recorded token total");
+        _assertEq(splitter.totalReleased(token), protocolToken + nextProtocolToken, "released token total");
+        _assertEq(splitter.totalRecorded(address(weth)), protocolPair + nextProtocolPair, "recorded WETH total");
+        _assertEq(splitter.totalReleased(address(weth)), protocolPair + nextProtocolPair, "released WETH total");
+        _assertEq(
+            LaunchToken(token).votingExcludedSupply(),
+            SUPPLY - protocolToken - nextProtocolToken,
+            "claimed protocol fees stayed excluded"
+        );
+        _assertTrue(!LaunchToken(token).votingExcluded(SPLIT_RECIPIENT_A), "recipient A unexpectedly nonvoting");
+        _assertTrue(!LaunchToken(token).votingExcluded(SPLIT_RECIPIENT_B), "recipient B unexpectedly nonvoting");
+    }
+
+    function testFeeSplitterClaimsRespectMaxWalletAndDirectTransfersRemainUnallocated() public {
+        address[] memory recipients = new address[](1);
+        recipients[0] = SPLIT_RECIPIENT_A;
+        uint16[] memory shares = new uint16[](1);
+        shares[0] = 10_000;
+        FeeSplitter splitter = new FeeSplitter(address(feeRouter), address(this), recipients, shares);
+
+        feeRouter.setFeeConfig(address(splitter), BURNER_RECIPIENT, 10_000, 0, 0);
+        (address token, uint256 positionId) = _launch();
+        LauncherTypes.LaunchedToken memory launched = factory.getLaunchedToken(token);
+        uint128 tokenFees = uint128(20_000 ether);
+        MockV3Pool(launched.pool).approveToken(token, address(positionManager), tokenFees);
+        (uint128 amount0, uint128 amount1) = launched.isToken0 ? (tokenFees, uint128(0)) : (uint128(0), tokenFees);
+        positionManager.accrueFrom(positionId, launched.pool, amount0, amount1);
+
+        // Upstream collection succeeds because the splitter itself is exempt.
+        locker.claimFees(token);
+        _assertEq(LaunchToken(token).balanceOf(address(splitter)), tokenFees, "splitter missing restricted fees");
+        _assertEq(splitter.epochDeposited(1, token), tokenFees, "splitter deposit not recorded");
+        _assertTrue(!LaunchToken(token).feeSenderExempt(address(splitter)), "splitter got fee-sender privilege");
+        _assertEq(LaunchToken(token).feeDepositSource(address(splitter)), address(0), "splitter got deposit privilege");
+
+        MockV3Pool(launched.pool).sendToken(token, CLAIM_RECIPIENT, 1 ether);
+        vm.prank(CLAIM_RECIPIENT);
+        LaunchToken(token).transfer(address(splitter), 1 ether);
+        _assertEq(splitter.epochDeposited(1, token), tokenFees, "direct transfer was allocated");
+        _assertEq(splitter.unallocatedBalance(token), 1 ether, "direct transfer not reported as unallocated");
+        _assertEq(splitter.releasable(1, token, SPLIT_RECIPIENT_A), tokenFees, "direct transfer changed entitlement");
+
+        vm.expectRevert(LaunchToken.MaxWalletExceeded.selector);
+        vm.prank(SPLIT_RECIPIENT_A);
+        splitter.release(1, token);
+
+        _assertEq(splitter.releasable(1, token, SPLIT_RECIPIENT_A), tokenFees, "reverted claim changed entitlement");
+        vm.roll(LaunchToken(token).restrictionsEndBlock());
+        vm.prank(SPLIT_RECIPIENT_A);
+        splitter.release(1, token);
+
+        _assertEq(LaunchToken(token).balanceOf(SPLIT_RECIPIENT_A), tokenFees, "post-restriction claim failed");
+        _assertEq(LaunchToken(token).balanceOf(address(splitter)), 1 ether, "claim consumed direct transfer");
+        _assertEq(splitter.unallocatedBalance(token), 1 ether, "unallocated transfer changed after claim");
+    }
+
+    function testFeeRouterAdminCanAtomicallyChangeRecipientsAndShares() public {
+        _assertEq(feeRouter.protocolRecipient(), PROTOCOL_RECIPIENT, "wrong default protocol recipient");
+        _assertEq(feeRouter.burnerRecipient(), BURNER_RECIPIENT, "wrong default burner recipient");
+        _assertEq(feeRouter.protocolShareBps(), 3_333, "wrong default protocol share");
+        _assertEq(feeRouter.burnerShareBps(), 3_333, "wrong default burner share");
+        _assertEq(feeRouter.ctoShareBps(), 3_334, "wrong default CTO share");
+
+        address newProtocol = address(0x7001);
+        address newBurner = address(0xB001);
+        feeRouter.setFeeConfig(newProtocol, newBurner, 2_000, 3_000, 5_000);
+
+        _assertEq(feeRouter.protocolRecipient(), newProtocol, "protocol recipient not updated");
+        _assertEq(feeRouter.burnerRecipient(), newBurner, "burner recipient not updated");
+        _assertEq(feeRouter.protocolShareBps(), 2_000, "protocol share not updated");
+        _assertEq(feeRouter.burnerShareBps(), 3_000, "burner share not updated");
+        _assertEq(feeRouter.ctoShareBps(), 5_000, "CTO share not updated");
+
+        (bool badSum,) = address(feeRouter)
+            .call(
+                abi.encodeCall(
+                    FeeRouter.setFeeConfig, (newProtocol, newBurner, uint16(3_333), uint16(3_333), uint16(3_333))
+                )
+            );
+        _assertTrue(!badSum, "invalid split accepted");
+        _assertEq(feeRouter.ctoShareBps(), 5_000, "invalid split partially applied");
+
+        vm.prank(address(0xB0B));
+        (bool unauthorized,) = address(feeRouter)
+            .call(
+                abi.encodeCall(
+                    FeeRouter.setFeeConfig, (newProtocol, newBurner, uint16(3_333), uint16(3_333), uint16(3_334))
+                )
+            );
+        _assertTrue(!unauthorized, "non-owner changed fee config");
     }
 
     function testOneTimeWiringCannotBeReplaced() public {
@@ -377,30 +599,62 @@ contract NoxaFactoryIntegrationTest {
         _assertTrue(!routerOk && !lockerOk && !ctoOk, "one-time wiring changed");
     }
 
-    function testCurrentTreasuryExemptionCanBePermissionlesslySynced() public {
+    function testCurrentFeeRecipientExemptionsCanBePermissionlesslySynced() public {
         (address token,) = _launch();
         LauncherTypes.LaunchedToken memory launched = factory.getLaunchedToken(token);
-        address newTreasury = address(0x7EA50002);
-        MockV3Pool(launched.pool).sendToken(token, newTreasury, 100 ether);
+        address newProtocol = address(0x7EA50002);
+        address newBurner = address(0xB0120002);
+        MockV3Pool(launched.pool).sendToken(token, newProtocol, 100 ether);
+        MockV3Pool(launched.pool).sendToken(token, newBurner, 200 ether);
         for (uint160 i = 0; i < 6; ++i) {
             MockV3Pool(launched.pool).sendToken(token, address(uint160(0xA000) + i), 10_000 ether);
         }
-        _assertEq(LaunchToken(token).votingExcludedSupply(), SUPPLY - 60_100 ether, "pre-sync aggregate");
-        feeRouter.setTreasury(newTreasury);
-        _assertTrue(!LaunchToken(token).restrictionExempt(newTreasury), "treasury unexpectedly exempt");
+        _assertEq(LaunchToken(token).votingExcludedSupply(), SUPPLY - 60_300 ether, "pre-sync aggregate");
+        feeRouter.setFeeConfig(newProtocol, newBurner, 3_333, 3_333, 3_334);
+        _assertTrue(!LaunchToken(token).restrictionExempt(newProtocol), "protocol unexpectedly exempt");
+        _assertTrue(!LaunchToken(token).restrictionExempt(newBurner), "burner unexpectedly exempt");
 
         vm.prank(address(0xB0B));
-        factory.syncFeeTreasuryExemption(token);
-        _assertTrue(LaunchToken(token).restrictionExempt(newTreasury), "treasury sync failed");
-        _assertTrue(!LaunchToken(token).votingExcluded(newTreasury), "sync changed an active round boundary");
-        _assertEq(LaunchToken(token).votingExcludedSupply(), SUPPLY - 60_100 ether, "sync changed denominator");
+        factory.syncFeeRecipientExemptions(token);
+        _assertTrue(LaunchToken(token).restrictionExempt(newProtocol), "protocol sync failed");
+        _assertTrue(LaunchToken(token).restrictionExempt(newBurner), "burner sync failed");
+        _assertTrue(!LaunchToken(token).votingExcluded(newProtocol), "sync changed protocol voting boundary");
+        _assertTrue(!LaunchToken(token).votingExcluded(newBurner), "sync changed burner voting boundary");
+        _assertEq(LaunchToken(token).votingExcludedSupply(), SUPPLY - 60_300 ether, "sync changed denominator");
 
         // Voting exclusion is synchronized atomically with the next exact snapshot.
         ctoFund.openRound(token);
-        _assertTrue(LaunchToken(token).votingExcluded(newTreasury), "snapshot left treasury voting");
+        _assertTrue(LaunchToken(token).votingExcluded(newProtocol), "snapshot left protocol voting");
+        _assertTrue(LaunchToken(token).votingExcluded(newBurner), "snapshot left burner voting");
         _assertEq(
-            LaunchToken(token).votingExcludedSupplyAt(1), SUPPLY - 60_000 ether, "snapshot included treasury inventory"
+            LaunchToken(token).votingExcludedSupplyAt(1),
+            SUPPLY - 60_000 ether,
+            "snapshot included fixed-recipient inventory"
         );
+    }
+
+    function testRecipientRotationCannotBlockRestrictedFeeClaim() public {
+        (address token, uint256 positionId) = _launch();
+        LauncherTypes.LaunchedToken memory launched = factory.getLaunchedToken(token);
+        address newProtocol = address(0x7002);
+        address newBurner = address(0xB002);
+        feeRouter.setFeeConfig(newProtocol, newBurner, 3_333, 3_333, 3_334);
+
+        uint128 tokenFees = uint128(50_000 ether);
+        MockV3Pool(launched.pool).approveToken(token, address(positionManager), tokenFees);
+        (uint128 amount0, uint128 amount1) = launched.isToken0 ? (tokenFees, uint128(0)) : (uint128(0), tokenFees);
+        positionManager.accrueFrom(positionId, launched.pool, amount0, amount1);
+
+        // Each fixed share exceeds maxWalletAmount. claimFees must synchronize
+        // the new recipients before FeeRouter transfers to them.
+        locker.claimFees(token);
+
+        _assertTrue(LaunchToken(token).restrictionExempt(newProtocol), "rotated protocol not exempt");
+        _assertTrue(LaunchToken(token).restrictionExempt(newBurner), "rotated burner not exempt");
+        _assertTrue(
+            LaunchToken(token).balanceOf(newProtocol) > LaunchToken(token).maxWalletAmount(), "protocol under cap"
+        );
+        _assertTrue(LaunchToken(token).balanceOf(newBurner) > LaunchToken(token).maxWalletAmount(), "burner under cap");
     }
 
     function testVaultTokenClaimBypassesOnlyRecipientMaxWalletCheck() public {
@@ -421,7 +675,9 @@ contract NoxaFactoryIntegrationTest {
         positionManager.accrueFrom(positionId, launched.pool, amount0, amount1);
         locker.claimFees(token);
 
-        uint256 vaultShare = uint256(tokenFees) - (uint256(tokenFees) * 3_000) / 10_000;
+        uint256 protocolShare = (uint256(tokenFees) * 3_333) / 10_000;
+        uint256 burnerShare = (uint256(tokenFees) * 3_333) / 10_000;
+        uint256 vaultShare = uint256(tokenFees) - protocolShare - burnerShare;
         _assertEq(LaunchToken(token).balanceOf(vault), vaultShare, "canonical fee path missed vault");
 
         vm.prank(DEV_WALLET);
@@ -430,6 +686,10 @@ contract NoxaFactoryIntegrationTest {
     }
 
     function _launch() private returns (address token, uint256 positionId) {
+        return _launchWithValue(0);
+    }
+
+    function _launchWithValue(uint256 value) private returns (address token, uint256 positionId) {
         LauncherTypes.LaunchParams memory params = LauncherTypes.LaunchParams({
             name: "Noxa CTO Test",
             symbol: "NCTO",
@@ -438,7 +698,7 @@ contract NoxaFactoryIntegrationTest {
             socials: LauncherTypes.Socials({telegram: "", twitter: "", discord: "", website: "", farcaster: ""}),
             devWallet: DEV_WALLET
         });
-        return factory.launchToken(params, 0, 0, keccak256(abi.encode(block.number, address(this))));
+        return factory.launchToken{value: value}(params, 0, 0, keccak256(abi.encode(block.number, address(this))));
     }
 
     function _assertEq(address actual, address expected, string memory reason) private pure {
